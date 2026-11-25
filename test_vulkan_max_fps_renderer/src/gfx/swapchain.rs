@@ -16,6 +16,9 @@ pub enum Acquire {
     NotReady,
     /// VK_ERROR_OUT_OF_DATE_KHR — recreate the swapchain.
     OutOfDate,
+    /// VK_ERROR_DEVICE_LOST — fullscreen switches (Alt+Tab) can trigger it;
+    /// recreate the swapchain, the device usually survives.
+    DeviceLost,
 }
 
 pub struct Swapchain {
@@ -156,6 +159,7 @@ impl Swapchain {
             vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR => Acquire::Image(idx),
             vk::Result::NOT_READY => Acquire::NotReady,
             vk::Result::ERROR_OUT_OF_DATE_KHR => Acquire::OutOfDate,
+            vk::Result::ERROR_DEVICE_LOST => Acquire::DeviceLost,
             other => return Err(anyhow!("acquire: {other:?}")),
         })
     }

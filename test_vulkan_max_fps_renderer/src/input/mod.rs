@@ -295,7 +295,7 @@ impl InputCore {
         // events may be missed on desync; axes/triggers would be polled here too
         if let (Some(pad), Some(gamepad)) = (&mut self.pad, &self.gamepad) {
             for i in 0..PAD_BUTTONS {
-                let btn = SDL_GamepadButton((i as ::core::ffi::c_int));
+                let btn = SDL_GamepadButton(i as ::core::ffi::c_int);
                 if unsafe { SDL_GetGamepadButton(gamepad.handle, btn) } {
                     if !pad.level[i] {
                         // pressed without an event (or the event arrives next frame)

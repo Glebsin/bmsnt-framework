@@ -11,61 +11,32 @@
 // no console: a visible console forces DWM composition instead of flip
 #![windows_subsystem = "windows"]
 
-mod core;
-mod gfx;
-mod input;
-mod platform;
-mod ui;
-
 use anyhow::{anyhow, Context, Result};
 use std::time::Instant;
 
 use ash::vk;
 
-use crate::core::nvml::Nvml;
-use crate::core::time::{FrameStats, WARMUP_MS};
-use crate::gfx::device::GfxContext;
-use crate::gfx::frames::FramesInFlight;
-use crate::gfx::renderer::Renderer;
-use crate::gfx::swapchain::Swapchain;
-use crate::input::{Binding, InputCore};
-use crate::platform::window::Window;
-use crate::ui::text::{build_text, MAX_VERTS};
+use vk5k::core::nvml::Nvml;
+use vk5k::core::time::{FrameStats, WARMUP_MS};
+use vk5k::gfx::device::GfxContext;
+use vk5k::gfx::frames::FramesInFlight;
+use vk5k::gfx::renderer::Renderer;
+use vk5k::gfx::swapchain::Swapchain;
+use vk5k::input::{Binding, InputCore};
+use vk5k::platform::window::Window;
+use vk5k::ui::text::{build_text, MAX_VERTS};
 
 /// fps/stats averaging window
 const STATS_WINDOW_MS: u64 = 250;
 const FRAMES_IN_FLIGHT: usize = 8;
 
-static LOG_SINK: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
-
-#[macro_export]
-macro_rules! elog {
-    ($($arg:tt)*) => {{
-        use std::io::Write;
-        if let Ok(mut f) = $crate::LOG_SINK.lock() {
-            if let Some(file) = f.as_mut() {
-                let _ = writeln!(file, $($arg)*);
-            }
-        }
-    }};
-}
-
 fn main() -> Result<()> {
-    // GUI-subsystem: no stdout — log goes to vk5k.log next to the exe.
-    let log_path = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("vk5k.log")));
-    if let Some(path) = &log_path {
-        if let Ok(file) = std::fs::File::create(path) {
-            *crate::LOG_SINK.lock().unwrap() = Some(file);
-        }
-    }
-
+    vk5k::init_log("vk5k.log");
     // GPU clock lock needs admin: relaunch self via UAC (runas) when not
     // elevated. UAC declined -> continue without the lock.
     unsafe {
         if windows_sys::Win32::UI::Shell::IsUserAnAdmin() == 0 {
-            crate::elog!("not elevated — relaunching via UAC (runas)");
+            vk5k::elog!("not elevated — relaunching via UAC (runas)");
             if let Ok(exe) = std::env::current_exe() {
                 let exe_w: Vec<u16> = exe
                     .as_os_str()
@@ -86,7 +57,7 @@ fn main() -> Result<()> {
                 if r as isize > 32 {
                     std::process::exit(0);
                 }
-                crate::elog!("UAC declined — running without the clock lock");
+                vk5k::elog!("UAC declined — running without the clock lock");
             }
         }
     }
@@ -113,11 +84,11 @@ unsafe fn run() -> Result<()> {
     // lock GPU clock to the driver max (NVML, needs admin); reset on exit
     let _nvml = match Nvml::init_and_lock_max() {
         Ok(n) => {
-            crate::elog!("GPU: {} | clock locked at {} MHz", n.gpu_name, n.locked_mhz);
+            vk5k::elog!("GPU: {} | clock locked at {} MHz", n.gpu_name, n.locked_mhz);
             Some(n)
         }
         Err(e) => {
-            crate::elog!("NVML: {e} — clock not locked");
+            vk5k::elog!("NVML: {e} — clock not locked");
             None
         }
     };
@@ -125,10 +96,10 @@ unsafe fn run() -> Result<()> {
     let ctx = GfxContext::new(window.hwnd())?;
     let mut swapchain = Swapchain::new(&ctx)?;
     let mut renderer = Renderer::new(&ctx)?;
-    renderer.create_swapchain_objects(ctx.device(), &swapchain)?;
+    renderer.create_swapchain_objects(&ctx, &swapchain)?;
     let mut frames = FramesInFlight::new(ctx.device(), FRAMES_IN_FLIGHT);
 
-    crate::elog!(
+    vk5k::elog!(
         "swapchain: {}x{} images={} present_mode={:?}",
         swapchain.extent.width,
         swapchain.extent.height,
@@ -212,15 +183,21 @@ unsafe fn run() -> Result<()> {
             stats.acq_calls += 1;
             let t0 = Instant::now();
             match swapchain.acquire(ctx.device(), frames.image_semaphore(slot))? {
-                gfx::swapchain::Acquire::Image(idx) => {
+                vk5k::gfx::swapchain::Acquire::Image(idx) => {
                     stats.t_acq += t0.elapsed().as_nanos();
                     break idx;
                 }
-                gfx::swapchain::Acquire::NotReady => {
+                vk5k::gfx::swapchain::Acquire::NotReady => {
                     stats.acq_retries += 1;
                 }
-                gfx::swapchain::Acquire::OutOfDate => {
+                vk5k::gfx::swapchain::Acquire::OutOfDate => {
                     stats.t_acq += t0.elapsed().as_nanos();
+                    need_recreate = true;
+                    break u32::MAX;
+                }
+                vk5k::gfx::swapchain::Acquire::DeviceLost => {
+                    stats.t_acq += t0.elapsed().as_nanos();
+                    vk5k::elog!("acquire: device lost (fullscreen switch) — recreating");
                     need_recreate = true;
                     break u32::MAX;
                 }
@@ -308,6 +285,9 @@ unsafe fn run() -> Result<()> {
         stats.t_present += t0.elapsed().as_nanos();
         if let Err(vk::Result::ERROR_OUT_OF_DATE_KHR) = present_result {
             need_recreate = true;
+        } else if let Err(vk::Result::ERROR_DEVICE_LOST) = present_result {
+            vk5k::elog!("present: device lost (fullscreen switch) — recreating");
+            need_recreate = true;
         } else if let Err(e) = present_result {
             return Err(anyhow!("present: {e:?}"));
         }
@@ -382,8 +362,8 @@ unsafe fn recreate(
     renderer.destroy_swapchain_objects(ctx.device());
     swapchain.destroy(ctx.device());
     *swapchain = Swapchain::new(ctx)?;
-    renderer.create_swapchain_objects(ctx.device(), swapchain)?;
-    crate::elog!(
+    renderer.create_swapchain_objects(ctx, swapchain)?;
+    vk5k::elog!(
         "swapchain recreated: {}x{}",
         swapchain.extent.width,
         swapchain.extent.height

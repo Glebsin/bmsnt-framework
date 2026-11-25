@@ -7,8 +7,7 @@ use std::ptr;
 use ash::vk;
 use ash::{Entry, Instance};
 
-pub struct GfxContext {
-    /// keeps the Vulkan loader alive; must not be dropped early
+pub struct GfxContext {    /// keeps the Vulkan loader alive; must not be dropped early
     #[allow(dead_code)]
     entry: Entry,
     instance: Instance,
@@ -21,16 +20,55 @@ pub struct GfxContext {
     swapchain_loader: ash::khr::swapchain::Device,
 }
 
+/// Debug utils callback: validation messages go to the log file.
+unsafe extern "system" fn debug_callback(
+    severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    _types: vk::DebugUtilsMessageTypeFlagsEXT,
+    data: *const vk::DebugUtilsMessengerCallbackDataEXT,
+    _user: *mut c_void,
+) -> vk::Bool32 {
+    if let Some(d) = data.as_ref() {
+        let msg = if d.p_message.is_null() {
+            "(no message)".to_string()
+        } else {
+            CStr::from_ptr(d.p_message).to_string_lossy().into_owned()
+        };
+        crate::elog!("[VVL {:?}] {}", severity, msg);
+    }
+    vk::FALSE
+}
+
 impl GfxContext {
     /// `hwnd` — Win32 window handle.
     pub unsafe fn new(hwnd: *mut c_void) -> Result<Self> {
         let entry = Entry::load().map_err(|e| anyhow!("vulkan loader: {e:?}"))?;
 
-        let inst_exts = [
+        // TESTAPP_VALIDATE=1 (or vk5k) enables the Khronos validation layer
+        // + debug utils; violations are logged via elog
+        let validate = std::env::var("VALIDATE").is_ok();
+        let mut layers: Vec<*const i8> = Vec::new();
+        let mut inst_exts: Vec<*const i8> = vec![
             c"VK_KHR_surface".as_ptr(),
             c"VK_KHR_win32_surface".as_ptr(),
             c"VK_KHR_get_physical_device_properties2".as_ptr(),
         ];
+        if validate {
+            let has_layer = entry
+                .enumerate_instance_layer_properties()
+                .map_err(|e| anyhow!("layer enum: {e:?}"))?
+                .iter()
+                .any(|p| {
+                    let name = unsafe { CStr::from_ptr(p.layer_name.as_ptr()) };
+                    name == c"VK_LAYER_KHRONOS_validation"
+                });
+            if has_layer {
+                layers.push(c"VK_LAYER_KHRONOS_validation".as_ptr());
+                inst_exts.push(c"VK_EXT_debug_utils".as_ptr());
+                crate::elog!("validation layer enabled");
+            } else {
+                crate::elog!("validation layer not installed");
+            }
+        }
         let app_name = c"black-vk".as_ptr();
         let app = vk::ApplicationInfo {
             p_application_name: app_name,
@@ -39,6 +77,8 @@ impl GfxContext {
         };
         let inst_info = vk::InstanceCreateInfo {
             p_application_info: &app,
+            enabled_layer_count: layers.len() as u32,
+            pp_enabled_layer_names: layers.as_ptr(),
             enabled_extension_count: inst_exts.len() as u32,
             pp_enabled_extension_names: inst_exts.as_ptr(),
             ..Default::default()
@@ -46,6 +86,30 @@ impl GfxContext {
         let instance = entry
             .create_instance(&inst_info, None)
             .map_err(|e| anyhow!("create_instance: {e:?}"))?;
+
+        // debug messenger (only when validating)
+        if validate {
+            let dbg = ash::ext::debug_utils::Instance::load(&entry, &instance);
+            let name = c"vk5k".as_ptr();
+            let info = vk::DebugUtilsMessengerCreateInfoEXT {
+                message_severity: vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
+                message_type: vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                    | vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                    | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+                pfn_user_callback: Some(debug_callback),
+                p_user_data: name as *const c_void as *mut _ ,
+                ..Default::default()
+            };
+            let messenger = unsafe { dbg.create_debug_utils_messenger(&info, None) }
+                .map_err(|e| anyhow!("debug messenger: {e:?}"))?;
+            // the raw handle is intentionally never destroyed: the callback
+            // must stay alive until process shutdown (one instance per run);
+            // the loader struct is kept alive the same way
+            let _ = messenger;
+            std::mem::forget(dbg);
+            let _ = instance.handle();
+        }
         crate::elog!("instance created");
 
         // --- surface ---
