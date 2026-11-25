@@ -16,6 +16,7 @@
 
 mod core;
 mod gfx;
+mod input;
 mod platform;
 mod ui;
 
@@ -30,6 +31,7 @@ use crate::gfx::device::GfxContext;
 use crate::gfx::frames::FramesInFlight;
 use crate::gfx::renderer::Renderer;
 use crate::gfx::swapchain::Swapchain;
+use crate::input::{Binding, InputCore};
 use crate::platform::window::Window;
 use crate::ui::text::{build_text, MAX_VERTS};
 
@@ -148,17 +150,33 @@ unsafe fn run() -> Result<()> {
     let mut uploaded = false;
     let mut running = true;
 
+    // --- ядро инпута: action-mapping, edge-события, ns-таймстампы ---
+    let mut input = InputCore::new();
+    let act_quit = input.map(
+        "quit",
+        &[Binding::Key(sdl3_sys::everything::SDL_Scancode::ESCAPE), Binding::Pad(sdl3_sys::everything::SDL_GamepadButton::START)],
+    );
+    let act_jump = input.map(
+        "jump",
+        &[
+            Binding::Key(sdl3_sys::everything::SDL_Scancode::SPACE),
+            Binding::Mouse(1),
+            Binding::Pad(sdl3_sys::everything::SDL_GamepadButton::SOUTH),
+        ],
+    );
+    let mut inp_overlay = String::new();
+
     // --- fixed-dt update-стадия: сюда встаёт игровая логика (Фаза 2) ---
     const FIXED_DT: f64 = 1.0 / 120.0;
     let mut last = Instant::now();
     let mut update_acc = 0.0f64;
 
     while running {
-        // --- ввод ---
+        // --- ввод: ядро инпута осушает очередь событий раз в кадр ---
         let t_ev0 = Instant::now();
-        let ev = window.poll();
+        let ev = input.poll();
         stats.t_events += t_ev0.elapsed().as_nanos();
-        if ev.quit {
+        if ev.quit || input.pressed(act_quit) {
             break;
         }
 
@@ -167,6 +185,21 @@ unsafe fn run() -> Result<()> {
         update_acc += (now_inst - last).as_secs_f64();
         last = now_inst;
         while update_acc >= FIXED_DT {
+            // демо-обработка edge-событий: последний input -> оверлей с
+            // латентностью (timestamp события до момента consumo)
+            if let Some((id, ts)) = input.last_edge() {
+                let now_ns = unsafe { sdl3_sys::everything::SDL_GetTicksNS() };
+                let age_ms = now_ns.saturating_sub(ts) as f64 / 1e6;
+                inp_overlay = format!(
+                    "INP {} +{age_ms:.2}ms  ev={} pad={} jump={}",
+                    input.action_name(id),
+                    input.events_last_poll(),
+                    input.is_gamepad_connected() as u8,
+                    input.down(act_jump) as u8
+                );
+                uploaded = false;
+                break; // кадр уже содержит свежий input
+            }
             // TODO(Фаза 2): шаг симуляции/интерфейса
             update_acc -= FIXED_DT;
         }
@@ -231,6 +264,18 @@ unsafe fn run() -> Result<()> {
                 swapchain.extent.height as f32,
                 status_color,
             ));
+            // третья строка — последний input-эдж с латентностью (демо Фазы 2.1)
+            if !inp_overlay.is_empty() {
+                verts.extend(build_text(
+                    &inp_overlay,
+                    16.0,
+                    64.0,
+                    2.0,
+                    swapchain.extent.width as f32,
+                    swapchain.extent.height as f32,
+                    (0.5, 0.8, 1.0),
+                ));
+            }
             if verts.len() > MAX_VERTS {
                 return Err(anyhow!("text too long: {} verts", verts.len()));
             }

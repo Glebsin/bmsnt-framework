@@ -10,6 +10,7 @@ sdl3-sys = { version = "0.7.3", default-features = false, features = [
     "build-from-source-static",
     "no-default-subsystems",
     "sdl-video",
+    "sdl-joystick",
 ] }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

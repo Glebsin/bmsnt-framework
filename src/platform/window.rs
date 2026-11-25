@@ -6,12 +6,6 @@ use std::ptr;
 
 use sdl3_sys::everything::*;
 
-/// События окна за один опрос.
-#[derive(Default)]
-pub struct WindowEvent {
-    pub quit: bool,
-}
-
 pub struct Window {
     handle: *mut SDL_Window,
 }
@@ -22,7 +16,7 @@ impl Window {
     /// Важно: БЕЗ SDL_WINDOW_RESIZABLE — иначе Windows уводит свопчейн
     /// с эксклюзивного flip-пути в композицию DWM (fps 6.6k -> 2.8k).
     pub unsafe fn new(title: &str, w: c_int, h: c_int) -> Result<Self> {
-        if !SDL_Init(SDL_INIT_VIDEO) {
+        if !SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD) {
             return Err(sdl_err("SDL_Init"));
         }
         let title = CString::new(title)?;
@@ -76,24 +70,6 @@ impl Window {
             }
             hwnd
         }
-    }
-
-    /// Опрос событий: выход (крестик окна / ESC).
-    pub fn poll(&self) -> WindowEvent {
-        let mut ev = WindowEvent::default();
-        let mut event: SDL_Event = unsafe { std::mem::zeroed() };
-        unsafe {
-            while SDL_PollEvent(&mut event) {
-                if event.r#type == SDL_EventType::QUIT.0 {
-                    ev.quit = true;
-                } else if event.r#type == SDL_EventType::KEY_DOWN.0
-                    && event.key.key == SDLK_ESCAPE
-                {
-                    ev.quit = true;
-                }
-            }
-        }
-        ev
     }
 
     pub fn destroy(&self) {
