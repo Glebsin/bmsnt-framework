@@ -1,0 +1,115 @@
+//! Обёртка над SDL3-окном: создание, события, fullscreen-режим.
+
+use anyhow::{anyhow, Result};
+use std::ffi::{c_int, c_void, CStr, CString};
+use std::ptr;
+
+use sdl3_sys::everything::*;
+
+/// События окна за один опрос.
+#[derive(Default)]
+pub struct WindowEvent {
+    pub quit: bool,
+}
+
+pub struct Window {
+    handle: *mut SDL_Window,
+}
+
+impl Window {
+    /// Создаёт скрытое окно, ставит эксклюзивный fullscreen-режим дисплея
+    /// до показа (без перехода windowed -> fullscreen).
+    /// Важно: БЕЗ SDL_WINDOW_RESIZABLE — иначе Windows уводит свопчейн
+    /// с эксклюзивного flip-пути в композицию DWM (fps 6.6k -> 2.8k).
+    pub unsafe fn new(title: &str, w: c_int, h: c_int) -> Result<Self> {
+        if !SDL_Init(SDL_INIT_VIDEO) {
+            return Err(sdl_err("SDL_Init"));
+        }
+        let title = CString::new(title)?;
+        let handle = SDL_CreateWindow(
+            title.as_ptr(),
+            w,
+            h,
+            SDL_WINDOW_FULLSCREEN | SDL_WINDOW_HIDDEN,
+        );
+        if handle.is_null() {
+            return Err(sdl_err("SDL_CreateWindow"));
+        }
+        let display = SDL_GetPrimaryDisplay();
+        let mode = SDL_GetDesktopDisplayMode(display);
+        if mode.is_null() {
+            return Err(sdl_err("SDL_GetDesktopDisplayMode"));
+        }
+        if !SDL_SetWindowFullscreenMode(handle, mode) {
+            return Err(sdl_err("SDL_SetWindowFullscreenMode(exclusive)"));
+        }
+        SDL_SyncWindow(handle);
+        SDL_ShowWindow(handle);
+
+        let flags = SDL_GetWindowFlags(handle);
+        let exclusive = !SDL_GetWindowFullscreenMode(handle).is_null();
+        crate::elog!(
+            "window flags: {:#x} fullscreen={} exclusive={exclusive}",
+            u64::from(flags),
+            flags & SDL_WINDOW_FULLSCREEN != 0
+        );
+        crate::elog!(
+            "display: {}x{} @ {:.0} Hz",
+            (*mode).w,
+            (*mode).h,
+            (*mode).refresh_rate
+        );
+        Ok(Self { handle })
+    }
+
+    pub fn hwnd(&self) -> *mut c_void {
+        unsafe {
+            let props = SDL_GetWindowProperties(self.handle);
+            let hwnd = SDL_GetPointerProperty(
+                props,
+                SDL_PROP_WINDOW_WIN32_HWND_POINTER,
+                ptr::null_mut::<c_void>(),
+            );
+            if hwnd.is_null() {
+                // без HWND двигаться нельзя
+                panic!("SDL_GetPointerProperty(HWND) = null");
+            }
+            hwnd
+        }
+    }
+
+    /// Опрос событий: выход (крестик окна / ESC).
+    pub fn poll(&self) -> WindowEvent {
+        let mut ev = WindowEvent::default();
+        let mut event: SDL_Event = unsafe { std::mem::zeroed() };
+        unsafe {
+            while SDL_PollEvent(&mut event) {
+                if event.r#type == SDL_EventType::QUIT.0 {
+                    ev.quit = true;
+                } else if event.r#type == SDL_EventType::KEY_DOWN.0
+                    && event.key.key == SDLK_ESCAPE
+                {
+                    ev.quit = true;
+                }
+            }
+        }
+        ev
+    }
+
+    pub fn destroy(&self) {
+        unsafe {
+            SDL_DestroyWindow(self.handle);
+            SDL_Quit();
+        }
+    }
+}
+
+fn sdl_err(ctx: &str) -> anyhow::Error {
+    let raw = SDL_GetError();
+    let msg = if raw.is_null() {
+        "(no error)".to_string()
+    } else {
+        unsafe { CStr::from_ptr(raw).to_string_lossy().into_owned() }
+    };
+    anyhow!("[{ctx}] {msg}")
+}

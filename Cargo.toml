@@ -1,0 +1,29 @@
+[package]
+name = "vk5k"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+ash = { package = "pixelforge-ash", version = "0.38.1" }
+sdl3-sys = { version = "0.7.3", default-features = false, features = [
+    "build-from-source-static",
+    "no-default-subsystems",
+    "sdl-video",
+] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

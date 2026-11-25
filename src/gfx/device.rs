@@ -1,0 +1,192 @@
+//! Контекст: instance, surface, устройство, очередь. Владеет Vulkan-загрузчиком.
+
+use anyhow::{anyhow, Result};
+use std::ffi::{c_void, CStr};
+use std::ptr;
+
+use ash::vk;
+use ash::{Entry, Instance};
+
+pub struct GfxContext {
+    /// держит живым загрузчик Vulkan; не удалять
+    #[allow(dead_code)]
+    entry: Entry,
+    instance: Instance,
+    surface: vk::SurfaceKHR,
+    pub pdevice: vk::PhysicalDevice,
+    device: ash::Device,
+    pub queue_family: u32,
+    pub queue: vk::Queue,
+    surface_instance: ash::khr::surface::Instance,
+    swapchain_loader: ash::khr::swapchain::Device,
+}
+
+impl GfxContext {
+    /// hwnd — HWND окна (Win32).
+    pub unsafe fn new(hwnd: *mut c_void) -> Result<Self> {
+        let entry = Entry::load().map_err(|e| anyhow!("vulkan loader: {e:?}"))?;
+
+        let inst_exts = [
+            c"VK_KHR_surface".as_ptr(),
+            c"VK_KHR_win32_surface".as_ptr(),
+            c"VK_KHR_get_physical_device_properties2".as_ptr(),
+        ];
+        let app_name = c"black-vk".as_ptr();
+        let app = vk::ApplicationInfo {
+            p_application_name: app_name,
+            api_version: vk::API_VERSION_1_4,
+            ..Default::default()
+        };
+        let inst_info = vk::InstanceCreateInfo {
+            p_application_info: &app,
+            enabled_extension_count: inst_exts.len() as u32,
+            pp_enabled_extension_names: inst_exts.as_ptr(),
+            ..Default::default()
+        };
+        let instance = entry
+            .create_instance(&inst_info, None)
+            .map_err(|e| anyhow!("create_instance: {e:?}"))?;
+        crate::elog!("instance created");
+
+        // --- поверхность ---
+        let hinstance =
+            windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(ptr::null());
+        if hinstance.is_null() {
+            return Err(anyhow!("GetModuleHandleW = null"));
+        }
+        let win32_surface = ash::khr::win32_surface::Instance::load(&entry, &instance);
+        let surface_info = vk::Win32SurfaceCreateInfoKHR {
+            hinstance: hinstance as isize,
+            hwnd: hwnd as isize,
+            ..Default::default()
+        };
+        let surface = {
+            let fp = win32_surface.fp();
+            let mut out = vk::SurfaceKHR::null();
+            let r = (fp.create_win32_surface_khr)(
+                instance.handle(),
+                &surface_info,
+                ptr::null(),
+                &mut out,
+            );
+            if r != vk::Result::SUCCESS {
+                return Err(anyhow!("create_win32_surface: {r:?}"));
+            }
+            out
+        };
+        crate::elog!("surface created");
+
+        let surface_instance = ash::khr::surface::Instance::load(&entry, &instance);
+
+        // --- устройство: первый с graphics+present ---
+        let devices = instance
+            .enumerate_physical_devices()
+            .map_err(|e| anyhow!("enumerate_physical_devices: {e:?}"))?;
+        if devices.is_empty() {
+            return Err(anyhow!("no physical devices"));
+        }
+        let mut chosen: Option<(vk::PhysicalDevice, u32)> = None;
+        for pd in &devices {
+            let props = instance.get_physical_device_properties(*pd);
+            let families = instance
+                .get_physical_device_queue_family_properties(*pd)
+                .into_iter()
+                .enumerate();
+            for (idx, qf) in families {
+                let graphics = qf.queue_flags.contains(vk::QueueFlags::GRAPHICS);
+                let present = {
+                    let mut ok = 0u32;
+                    let r = (surface_instance
+                        .fp()
+                        .get_physical_device_surface_support_khr)(*pd, idx as u32, surface, &mut ok);
+                    r == vk::Result::SUCCESS && ok == 1
+                };
+                if graphics && present {
+                    crate::elog!(
+                        "device: {} (queue family {idx})",
+                        CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy()
+                    );
+                    chosen = Some((*pd, idx as u32));
+                    break;
+                }
+            }
+            if chosen.is_some() {
+                break;
+            }
+        }
+        let (pdevice, qfi) = chosen.ok_or_else(|| anyhow!("no device with graphics+present queue"))?;
+
+        let queue_priorities = [1.0f32];
+        let queue_info = vk::DeviceQueueCreateInfo {
+            queue_family_index: qfi,
+            queue_count: 1,
+            p_queue_priorities: queue_priorities.as_ptr(),
+            ..Default::default()
+        };
+        let dev_exts = [c"VK_KHR_swapchain".as_ptr()];
+        // dynamicRendering — core-фича, но по спеке её нужно ЯВНО включить
+        // через Vulkan13Features (по умолчанию false; драйвер может не проверить,
+        // validation layer — проверит)
+        let mut vulkan13_features = vk::PhysicalDeviceVulkan13Features {
+            dynamic_rendering: vk::TRUE,
+            ..Default::default()
+        };
+        let dev_info = vk::DeviceCreateInfo {
+            queue_create_info_count: 1,
+            p_queue_create_infos: &queue_info,
+            enabled_extension_count: dev_exts.len() as u32,
+            pp_enabled_extension_names: dev_exts.as_ptr(),
+            p_next: &mut vulkan13_features as *mut _ as *const c_void,
+            ..Default::default()
+        };
+        let device = instance
+            .create_device(pdevice, &dev_info, None)
+            .map_err(|e| anyhow!("create_device: {e:?}"))?;
+        let queue = device.get_device_queue(qfi, 0);
+        let swapchain_loader = ash::khr::swapchain::Device::load(&instance, &device);
+
+        Ok(Self {
+            entry,
+            instance,
+            surface,
+            pdevice,
+            device,
+            queue_family: qfi,
+            queue,
+            surface_instance,
+            swapchain_loader,
+        })
+    }
+
+    pub fn device(&self) -> &ash::Device {
+        &self.device
+    }
+
+    pub fn instance(&self) -> &Instance {
+        &self.instance
+    }
+
+    pub fn surface(&self) -> vk::SurfaceKHR {
+        self.surface
+    }
+
+    pub fn surface_instance(&self) -> &ash::khr::surface::Instance {
+        &self.surface_instance
+    }
+
+    pub fn swapchain_loader(&self) -> &ash::khr::swapchain::Device {
+        &self.swapchain_loader
+    }
+
+    /// Полное разрушение: device -> surface -> instance. Вызывать после того,
+    /// как всё остальное (renderer/swapchain/frames) уже уничтожено и idle.
+    pub unsafe fn destroy(self) {
+        self.device.destroy_device(None);
+        (self.surface_instance.fp().destroy_surface_khr)(
+            self.instance.handle(),
+            self.surface,
+            ptr::null(),
+        );
+        self.instance.destroy_instance(None);
+    }
+}
