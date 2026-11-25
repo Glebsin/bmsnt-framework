@@ -1,51 +1,51 @@
-//! Ядро инпута (Фаза 2.1) — в духе osu!lazer: action-mapping, edge-события,
-//! таймстампы каждого события в наносекундах SDL-монотонных тиков.
+//! Input core (Phase 2.1) — osu!lazer style: action mapping, edge events,
+//! per-event timestamps in SDL monotonic ns.
 //!
-//! Принципы минимальной задержки:
-//! - события опрашиваются КАЖДЫЙ кадр, до update/рендера (никакой очереди
-//!   «раз в тик»); кнопка, пришедшая в середине кадра, обрабатывается в его начале;
-//! - клавиатура и мышь — event-driven (SDL_EVENT_KEY_DOWN / MOUSE_BUTTON_DOWN,
-//!   повторы игнорируются), геймпад-кнопки — тоже события (gbutton);
-//!   оси/триггеры геймпада — поллинг состояния раз в кадр (у осей нет событий);
-//! - SDL3 даёт timestamp каждого события в наносекундах — для edge-состояний
-//!   он сохраняется, движок может мерить input-to-display латентность;
-//! - никаких аллокаций и HashMap в опросе: состояния в плоских массивах
-//!   по scancode / индексу кнопки.
+//! Low-latency principles:
+//! - events are drained EVERY frame, before update/render; a key pressed
+//!   mid-frame is handled at the start of the next frame;
+//! - keyboard and mouse are event-driven (SDL_EVENT_KEY_DOWN / MOUSE_BUTTON_DOWN,
+//!   repeats ignored); gamepad buttons are events too (gbutton);
+//!   gamepad axes/triggers are polled once per frame (axes have no events);
+//! - SDL3 gives every event a nanosecond timestamp — edges keep it, so the
+//!   engine can measure input-to-display latency;
+//! - no allocations or HashMap in the poll loop: state lives in flat arrays
+//!   indexed by scancode / button index.
 
 use sdl3_sys::everything::*;
 
-/// Число scancode-слотов SDL3.
+/// number of SDL3 scancode slots
 const SCANCODE_COUNT: usize = SDL_Scancode::COUNT.0 as usize;
-/// Слоты кнопок мыши: SDL индексирует 1..=5 (left, middle, right, x1, x2).
+/// mouse button slots; SDL indexes 1..=5 (left, middle, right, x1, x2)
 const MOUSE_BUTTONS: usize = 6;
-/// SDL_GamepadButton::COUNT не const-friendly — берём запас сверху
-/// (все стандартные кнопки + paddles + misc < 24).
+/// SDL_GamepadButton::COUNT is not const-friendly; all standard buttons +
+/// paddles + misc fit under 24
 const PAD_BUTTONS: usize = 24;
 
-/// Стабильный идентификатор действия. Индекс в `InputCore::actions`.
+/// Stable action id: index into `InputCore::actions`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ActionId(pub usize);
 
-/// Чем биндится действие.
+/// How an action is bound.
 #[derive(Clone, Copy)]
 pub enum Binding {
-    /// Физическая клавиша (scancode — независимо от раскладки).
+    /// physical key (scancode — layout independent)
     Key(SDL_Scancode),
-    /// Кнопка мыши: 1=left, 2=middle, 3=right, 4=x1, 5=x2.
+    /// mouse button: 1=left, 2=middle, 3=right, 4=x1, 5=x2
     Mouse(u8),
-    /// Кнопка геймпада по стандартной схеме SDL (SOUTH/EAST/...).
+    /// gamepad button in the standard SDL scheme (SOUTH/EAST/...)
     Pad(SDL_GamepadButton),
 }
 
-/// Состояние одного бинара (клавиша/кнопка): уровень + edge этого кадра.
+/// State of one binary input (key/button): level + this-frame edge.
 #[derive(Clone, Copy, Default)]
 struct Binary {
     down: bool,
-    /// edge «нажато в этом кадре» (true ровно один кадр)
+    /// pressed this frame (true for exactly one frame)
     pressed: bool,
-    /// edge «отпущено в этом кадре»
+    /// released this frame
     released: bool,
-    /// timestamp события последнего edge (ns, базис SDL_GetTicksNS)
+    /// timestamp of the latest edge event (ns, SDL_GetTicksNS basis)
     ts_ns: u64,
 }
 
@@ -56,7 +56,7 @@ impl Binary {
     }
 }
 
-/// Состояние геймпада: уровни + edge-события кнопок за кадр.
+/// Gamepad state: button levels + per-frame edges.
 #[derive(Clone, Copy, Default)]
 struct PadState {
     level: [bool; PAD_BUTTONS],
@@ -65,7 +65,7 @@ struct PadState {
     ts_ns: [u64; PAD_BUTTONS],
 }
 
-/// Плоское хранилище клавиатуры.
+/// Flat keyboard storage.
 struct Keyboard {
     keys: Vec<Binary>,
 }
@@ -83,7 +83,7 @@ impl Keyboard {
 struct Mouse {
     x: f32,
     y: f32,
-    /// накопленная дельта между кадрами (сумма всех xrel/yrel за кадр)
+    /// delta accumulated over the frame (sum of xrel/yrel events)
     dx: f32,
     dy: f32,
     wheel_x: f32,
@@ -91,35 +91,35 @@ struct Mouse {
     buttons: Vec<Binary>,
 }
 
-/// Действие: имя + биндинги.
+/// Action: name + bindings.
 struct ActionDef {
     name: &'static str,
     bindings: Vec<Binding>,
 }
 
-/// Состояние действия за кадр.
+/// Per-frame action state.
 #[derive(Clone, Copy, Default)]
 pub struct ActionState {
     pub down: bool,
     pub pressed: bool,
     pub released: bool,
-    /// timestamp самого свежего edge-события среди биндингов (ns)
+    /// timestamp of the freshest edge event among bindings (ns)
     pub ts_ns: u64,
 }
 
-/// Открытый геймпад.
+/// Open gamepad.
 struct Gamepad {
     handle: *mut SDL_Gamepad,
     instance_id: SDL_JoystickID,
 }
 
-/// Результат опроса событий за кадр.
+/// Per-frame poll result.
 #[derive(Default)]
 pub struct FrameEvents {
     pub quit: bool,
 }
 
-/// Ядро инпута. Один экземпляр на приложение; `poll()` — в начале каждого кадра.
+/// Input core. One instance per app; call `poll()` once at the start of each frame.
 pub struct InputCore {
     keyboard: Keyboard,
     mouse: Mouse,
@@ -127,9 +127,9 @@ pub struct InputCore {
     gamepad: Option<Gamepad>,
     actions: Vec<ActionDef>,
     action_states: Vec<ActionState>,
-    /// последнее edge-событие для отладочного оверлея: (действие, ts)
+    /// latest edge event for the debug overlay: (action, timestamp)
     last_edge: Option<(ActionId, u64)>,
-    /// сколько событий съедено за последний кадр (диагностика)
+    /// events consumed in the last poll (diagnostics)
     events_last_poll: u32,
 }
 
@@ -155,7 +155,7 @@ impl InputCore {
         }
     }
 
-    /// Регистрирует действие. ActionId = порядковый номер регистрации.
+    /// Register an action. ActionId = registration order.
     pub fn map(&mut self, name: &'static str, bindings: &[Binding]) -> ActionId {
         let id = ActionId(self.actions.len());
         self.actions.push(ActionDef {
@@ -166,12 +166,12 @@ impl InputCore {
         id
     }
 
-    /// Опрос событий SDL3: вызывать строго один раз в начале кадра,
-    /// до update и рендера. Полностью осушает очередь событий.
+    /// Drain the SDL3 event queue. Call exactly once per frame, before update
+    /// and render.
     pub fn poll(&mut self) -> FrameEvents {
         let mut ev = FrameEvents::default();
 
-        // edges живут ровно один кадр
+        // edges live for exactly one frame
         self.last_edge = None;
         for b in self.keyboard.keys.iter_mut() {
             b.clear_edges();
@@ -197,7 +197,7 @@ impl InputCore {
                     t if t == SDL_EventType::QUIT.0 => {
                         ev.quit = true;
                     }
-                    // клавиатура: event-driven, повторы игнорируем
+                    // keyboard: event-driven, repeats ignored
                     t if t == SDL_EventType::KEY_DOWN.0 => {
                         let k = &event.key;
                         if !k.repeat {
@@ -214,7 +214,7 @@ impl InputCore {
                         b.released = true;
                         b.ts_ns = k.timestamp;
                     }
-                    // мышь: движение суммируем в дельту кадра
+                    // mouse: motion deltas accumulate over the frame
                     t if t == SDL_EventType::MOUSE_MOTION.0 => {
                         let m = &event.motion;
                         self.mouse.x = m.x;
@@ -241,13 +241,13 @@ impl InputCore {
                         self.mouse.wheel_x += w.x;
                         self.mouse.wheel_y += w.y;
                     }
-                    // геймпад: подключение/отключение
+                    // gamepad hot-plug
                     t if t == SDL_EventType::GAMEPAD_ADDED.0 => {
                         let id = event.gdevice.which;
                         if self.gamepad.is_none() && SDL_IsGamepad(id) {
                             let handle = SDL_OpenGamepad(id);
                             if !handle.is_null() {
-                                crate::elog!("gamepad подключён (id {})", id.0);
+                                crate::elog!("gamepad connected (id {})", id.0);
                                 self.pad = Some(PadState::default());
                                 self.gamepad = Some(Gamepad {
                                     handle,
@@ -259,14 +259,14 @@ impl InputCore {
                     t if t == SDL_EventType::GAMEPAD_REMOVED.0 => {
                         if let Some(pad) = &self.gamepad {
                             if pad.instance_id == event.gdevice.which {
-                                crate::elog!("gamepad отключён");
+                                crate::elog!("gamepad disconnected");
                                 SDL_CloseGamepad(pad.handle);
                                 self.gamepad = None;
                                 self.pad = None;
                             }
                         }
                     }
-                    // геймпад-кнопки: события, как клавиатура
+                    // gamepad buttons: events, like the keyboard
                     t if t == SDL_EventType::GAMEPAD_BUTTON_DOWN.0 => {
                         let g = &event.gbutton;
                         if let Some(pad) = &mut self.pad {
@@ -291,14 +291,14 @@ impl InputCore {
         }
         self.events_last_poll = eaten;
 
-        // синхронизация уровня геймпада с драйвером (GetGamepadButton):
-        // события могли потеряться при рассинхроне, оси/триггеры поллим здесь же
+        // sync gamepad button levels with the driver (SDL_GetGamepadButton):
+        // events may be missed on desync; axes/triggers would be polled here too
         if let (Some(pad), Some(gamepad)) = (&mut self.pad, &self.gamepad) {
             for i in 0..PAD_BUTTONS {
                 let btn = SDL_GamepadButton((i as ::core::ffi::c_int));
                 if unsafe { SDL_GetGamepadButton(gamepad.handle, btn) } {
                     if !pad.level[i] {
-                        // нажали без события (или событие приедет в след. кадре)
+                        // pressed without an event (or the event arrives next frame)
                         pad.level[i] = true;
                         pad.pressed[i] = true;
                         pad.ts_ns[i] = unsafe { SDL_GetTicksNS() };
@@ -315,9 +315,9 @@ impl InputCore {
         ev
     }
 
-    /// Вычисление состояний действий из уровней биндингов. Один раз за кадр.
+    /// Compute action states from binding levels. Once per frame.
     fn compute_actions(&mut self) {
-        // отложенные апдейты last_edge, чтобы не конфликтовать по borrow
+        // defer last_edge update to avoid a borrow conflict
         let mut edge_seen: Option<(ActionId, u64)> = None;
 
         for (i, def) in self.actions.iter().enumerate() {
@@ -367,21 +367,21 @@ impl InputCore {
         }
     }
 
-    // --- запросы действий ---
+    // --- action queries ---
 
-    /// Действие нажато в ЭТОМ кадре (edge).
+    /// Action pressed THIS frame (edge).
     pub fn pressed(&self, a: ActionId) -> bool {
         self.action_states[a.0].pressed
     }
-    /// Действие отпущено в ЭТОМ кадре (edge).
+    /// Action released THIS frame (edge).
     pub fn released(&self, a: ActionId) -> bool {
         self.action_states[a.0].released
     }
-    /// Действие удерживается.
+    /// Action held down.
     pub fn down(&self, a: ActionId) -> bool {
         self.action_states[a.0].down
     }
-    /// Timestamp последнего edge-события действия (ns; 0 — edge не было).
+    /// Timestamp of the action's latest edge event (ns; 0 — no edge).
     pub fn edge_ts_ns(&self, a: ActionId) -> u64 {
         self.action_states[a.0].ts_ns
     }
@@ -389,7 +389,7 @@ impl InputCore {
         self.actions[a.0].name
     }
 
-    // --- запросы устройств напрямую ---
+    // --- direct device queries ---
 
     pub fn key_down(&self, sc: SDL_Scancode) -> bool {
         self.keyboard.keys[(sc.0 as usize) % SCANCODE_COUNT].down
@@ -400,7 +400,7 @@ impl InputCore {
     pub fn mouse_pos(&self) -> (f32, f32) {
         (self.mouse.x, self.mouse.y)
     }
-    /// Дельта мыши за кадр (сумма событий за кадр; для aim/cursor).
+    /// Mouse delta over the frame (sum of events; for aim/cursor).
     pub fn mouse_delta(&self) -> (f32, f32) {
         (self.mouse.dx, self.mouse.dy)
     }
@@ -417,7 +417,7 @@ impl InputCore {
         self.gamepad.is_some()
     }
 
-    /// Последнее edge-событие за кадр: (действие, timestamp). Для оверлея.
+    /// Latest edge event this frame: (action, timestamp). For the overlay.
     pub fn last_edge(&self) -> Option<(ActionId, u64)> {
         self.last_edge
     }

@@ -1,5 +1,4 @@
-//! Текст: растровый шрифт 5x7 -> треугольники. Временное решение до атласа
-//! глифов (Фаза 2).
+//! Text: 5x7 bitmap font -> triangles. Temporary until the glyph atlas (Phase 2).
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -11,7 +10,7 @@ pub struct Vertex {
     pub b: f32,
 }
 
-/// Верхняя граница вершин под текст (общий буфер ровно такого размера).
+/// Upper bound for text vertices (the shared buffer is exactly this size).
 pub const MAX_VERTS: usize = 8192;
 
 const FONT: [(&str, [u8; 7]); 22] = [
@@ -29,7 +28,7 @@ const FONT: [(&str, [u8; 7]); 22] = [
     ("P", [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000]),
     ("S", [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110]),
     (".", [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100]),
-    // буквы для статуса flip: FLIP OK / FLIP LOST DWM
+    // letters for the flip status: FLIP OK / FLIP LOST DWM
     ("L", [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111]),
     ("I", [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111]),
     ("O", [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110]),
@@ -50,7 +49,7 @@ fn ndc(px: f32, py: f32, w: f32, h: f32) -> (f32, f32) {
     (px / w * 2.0 - 1.0, 1.0 - py / h * 2.0)
 }
 
-/// Триангуляция текста в NDC-вершины под размер вьюпорта w x h, цвет (r,g,b).
+/// Triangulate text into NDC vertices for a w x h viewport, color (r,g,b).
 pub fn build_text(
     text: &str,
     x0: f32,

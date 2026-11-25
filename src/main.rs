@@ -1,17 +1,14 @@
-//! Чёрный экран + счётчик FPS. Сырой Vulkan через pixelforge-ash (Vulkan 1.4).
+//! Black screen + FPS counter. Raw Vulkan 1.4 via pixelforge-ash.
 //!
-//! Свопчейн: minImageCount = min+5 (глубокая очередь), PRESENT_MODE_IMMEDIATE,
-//! per-image done-семафоры, предзаписанные командные буферы.
-//!
-//! Окно: SDL3, эксклюзивный fullscreen с первого показа. Свопчейн
-//! пересоздаётся при OUT_OF_DATE (смена режима дисплея).
-//!
-//! GUI-subsystem: консольного окна нет, весь лог пишется в vk5k.log рядом
-//! с exe (видимое консольное окно ломает эксклюзивный flip на Windows).
-//!
-//! ESC — выход. BLACK_SCREEN_SECS=N — выйти самому через N секунд.
+//! Swapchain: minImageCount = min+5 (deep queue), PRESENT_MODE_IMMEDIATE,
+//! per-image done semaphores, pre-recorded command buffers.
+//! Window: SDL3, exclusive fullscreen from the first frame; swapchain is
+//! recreated on OUT_OF_DATE.
+//! GUI-subsystem: no console, all logging goes to vk5k.log next to the exe
+//! (a visible console window breaks exclusive flip on Windows).
+//! ESC — quit. BLACK_SCREEN_SECS=N — auto-exit after N seconds.
 
-// без консольного окна: видимый консоль форсирует композицию DWM вместо flip
+// no console: a visible console forces DWM composition instead of flip
 #![windows_subsystem = "windows"]
 
 mod core;
@@ -35,7 +32,7 @@ use crate::input::{Binding, InputCore};
 use crate::platform::window::Window;
 use crate::ui::text::{build_text, MAX_VERTS};
 
-/// длина окна усреднения fps/статистики
+/// fps/stats averaging window
 const STATS_WINDOW_MS: u64 = 250;
 const FRAMES_IN_FLIGHT: usize = 8;
 
@@ -54,8 +51,7 @@ macro_rules! elog {
 }
 
 fn main() -> Result<()> {
-    // GUI-subsystem: eprintln некуда писать — перенаправляем весь лог в файл
-    // vk5k.log рядом с exe. Ошибки старта лога не мешают работе.
+    // GUI-subsystem: no stdout — log goes to vk5k.log next to the exe.
     let log_path = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("vk5k.log")));
@@ -65,11 +61,11 @@ fn main() -> Result<()> {
         }
     }
 
-    // Лок частоты GPU требует админа: если процесс не elevated — перезапускаем
-    // себя через UAC (runas). Отклонил UAC — работаем без лока.
+    // GPU clock lock needs admin: relaunch self via UAC (runas) when not
+    // elevated. UAC declined -> continue without the lock.
     unsafe {
         if windows_sys::Win32::UI::Shell::IsUserAnAdmin() == 0 {
-            crate::elog!("нет прав администратора — перезапуск через UAC (runas)");
+            crate::elog!("not elevated — relaunching via UAC (runas)");
             if let Ok(exe) = std::env::current_exe() {
                 let exe_w: Vec<u16> = exe
                     .as_os_str()
@@ -90,12 +86,12 @@ fn main() -> Result<()> {
                 if r as isize > 32 {
                     std::process::exit(0);
                 }
-                crate::elog!("UAC отклонён — продолжаем без прав, лок частоты не сработает");
+                crate::elog!("UAC declined — running without the clock lock");
             }
         }
     }
 
-    // высокий приоритет: меньше планировочных джиттеров в p95/max кадра
+    // high priority: fewer scheduling jitters in p95/max
     unsafe {
         use windows_sys::Win32::System::Threading::{
             GetCurrentProcess, SetPriorityClass, HIGH_PRIORITY_CLASS,
@@ -114,16 +110,14 @@ unsafe fn run() -> Result<()> {
     let window = Window::new("black-vk", 1920, 1080)?;
     let start_ticks = sdl3_sys::everything::SDL_GetTicks();
 
-    // Лок максимальной доступной частоты GPU (NVML, требует админа — манифест
-    // requireAdministrator). Сброс при выходе. Пока действует всегда; позже —
-    // настройка «ультимативный режим».
+    // lock GPU clock to the driver max (NVML, needs admin); reset on exit
     let _nvml = match Nvml::init_and_lock_max() {
         Ok(n) => {
-            crate::elog!("GPU: {} | частота залочена на {} MHz", n.gpu_name, n.locked_mhz);
+            crate::elog!("GPU: {} | clock locked at {} MHz", n.gpu_name, n.locked_mhz);
             Some(n)
         }
         Err(e) => {
-            crate::elog!("NVML: {e} — частота не залочена");
+            crate::elog!("NVML: {e} — clock not locked");
             None
         }
     };
@@ -150,7 +144,7 @@ unsafe fn run() -> Result<()> {
     let mut uploaded = false;
     let mut running = true;
 
-    // --- ядро инпута: action-mapping, edge-события, ns-таймстампы ---
+    // --- input core: action mapping, edge events, ns timestamps ---
     let mut input = InputCore::new();
     let act_quit = input.map(
         "quit",
@@ -166,13 +160,13 @@ unsafe fn run() -> Result<()> {
     );
     let mut inp_overlay = String::new();
 
-    // --- fixed-dt update-стадия: сюда встаёт игровая логика (Фаза 2) ---
+    // --- fixed-dt update stage (120 Hz): game logic goes here ---
     const FIXED_DT: f64 = 1.0 / 120.0;
     let mut last = Instant::now();
     let mut update_acc = 0.0f64;
 
     while running {
-        // --- ввод: ядро инпута осушает очередь событий раз в кадр ---
+        // --- input: drain the event queue once per frame, before update ---
         let t_ev0 = Instant::now();
         let ev = input.poll();
         stats.t_events += t_ev0.elapsed().as_nanos();
@@ -180,13 +174,13 @@ unsafe fn run() -> Result<()> {
             break;
         }
 
-        // update-стадия: фиксированный шаг 120 Гц, рендер свободный
+        // update stage: fixed 120 Hz step, free-running render
         let now_inst = Instant::now();
         update_acc += (now_inst - last).as_secs_f64();
         last = now_inst;
         while update_acc >= FIXED_DT {
-            // демо-обработка edge-событий: последний input -> оверлей с
-            // латентностью (timestamp события до момента consumo)
+            // demo edge handling: last input -> overlay with latency
+            // (event timestamp vs now)
             if let Some((id, ts)) = input.last_edge() {
                 let now_ns = unsafe { sdl3_sys::everything::SDL_GetTicksNS() };
                 let age_ms = now_ns.saturating_sub(ts) as f64 / 1e6;
@@ -198,22 +192,22 @@ unsafe fn run() -> Result<()> {
                     input.down(act_jump) as u8
                 );
                 uploaded = false;
-                break; // кадр уже содержит свежий input
+                break; // frame already contains fresh input
             }
-            // TODO(Фаза 2): шаг симуляции/интерфейса
+            // TODO(Phase 2): simulation/UI step
             update_acc -= FIXED_DT;
         }
 
         let mut need_recreate = false;
 
-        // перед перезаписью слота кольцевого буфера ждать всех кадров не нужно:
-        // слот не переиспользуется, пока fence его кадра не сигналится
+        // no need to wait all frames before overwriting a ring slot:
+        // a slot is not reused until its fence signals
         let slot = frames.slot();
         let t0 = Instant::now();
         frames.ensure_idle(ctx.device(), slot)?;
         stats.t_wait += t0.elapsed().as_nanos();
 
-        // --- acquire (retry при NOT_READY, пересоздание при OUT_OF_DATE) ---
+        // --- acquire (retry on NOT_READY, recreate on OUT_OF_DATE) ---
         let img_idx = loop {
             stats.acq_calls += 1;
             let t0 = Instant::now();
@@ -239,7 +233,7 @@ unsafe fn run() -> Result<()> {
             continue;
         }
 
-        // --- контент (текст счётчика) ---
+        // --- content (counter text) ---
         if !uploaded {
             uploaded = true;
             for i in 0..swapchain.image_count() {
@@ -254,7 +248,7 @@ unsafe fn run() -> Result<()> {
                 swapchain.extent.height as f32,
                 (1.0, 1.0, 1.0),
             );
-            // вторая строка — статус эксклюзивного fullscreen, цветом
+            // second line: exclusive fullscreen status, colored
             verts.extend(build_text(
                 &status_text,
                 16.0,
@@ -264,7 +258,7 @@ unsafe fn run() -> Result<()> {
                 swapchain.extent.height as f32,
                 status_color,
             ));
-            // третья строка — последний input-эдж с латентностью (демо Фазы 2.1)
+            // third line: last input edge with latency (Phase 2.1 demo)
             if !inp_overlay.is_empty() {
                 verts.extend(build_text(
                     &inp_overlay,
@@ -282,7 +276,7 @@ unsafe fn run() -> Result<()> {
             renderer.upload_verts(&verts);
         }
 
-        // --- запись (только dirty) и submit ---
+        // --- record (dirty only) + submit ---
         let img_idx_u = img_idx as usize;
         if renderer.is_dirty(img_idx_u) {
             let t0 = Instant::now();
@@ -327,7 +321,7 @@ unsafe fn run() -> Result<()> {
         frames.advance();
         stats.end_frame();
 
-        // --- статистика раз в STATS_WINDOW_MS (после прогрева) ---
+        // --- stats every STATS_WINDOW_MS (after warmup) ---
         let now = sdl3_sys::everything::SDL_GetTicks();
         if now - stats.window_start >= STATS_WINDOW_MS {
             if now - start_ticks >= WARMUP_MS {
@@ -336,13 +330,12 @@ unsafe fn run() -> Result<()> {
                 stats.window_start = now;
                 if fps != shown_fps {
                     shown_fps = fps;
-                    // маркер композиции виден на экране, а не только в логе
+                    // composition marker visible on screen, not only in the log
                     text = if stats.flip_lost {
                         format!("FPS {fps} {ms:.2} [DWM]")
                     } else {
                         format!("FPS {fps}  {ms:.2}")
                     };
-                    // статус эксклюзивного fullscreen: зелёный / красный
                     if stats.flip_lost {
                         status_text = String::from("FLIP LOST DWM");
                         status_color = (1.0, 0.25, 0.2);
@@ -365,7 +358,7 @@ unsafe fn run() -> Result<()> {
         }
     }
 
-    // --- завершение ---
+    // --- teardown ---
     ctx.device().device_wait_idle().context("device_wait_idle")?;
     frames.on_idle();
     renderer.destroy(ctx.device());
@@ -376,8 +369,8 @@ unsafe fn run() -> Result<()> {
     Ok(())
 }
 
-/// Пересоздание свопчейна: idle -> destroy -> create -> пересборка
-/// image views/командных буферов под новый extent.
+/// Recreate the swapchain: idle -> destroy -> create -> rebuild views/CBs
+/// for the new extent.
 unsafe fn recreate(
     ctx: &GfxContext,
     swapchain: &mut Swapchain,

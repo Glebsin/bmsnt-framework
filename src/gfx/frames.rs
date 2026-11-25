@@ -1,20 +1,20 @@
-//! Кадры в полёте: fences + image-семафоры + софт-трекинг сигнальности.
+//! Frames in flight: fences + image semaphores + soft signaled tracking.
 //!
-//! Софт-трекинг нужен потому, что у Vulkan нет «пересигналить fence»:
-//! после device_wait_idle (пересоздание свопчейна) фактически вся работа
-//! завершена, но fence в reset-состоянии повесил бы следующий wait навсегда.
+//! Soft tracking exists because Vulkan cannot re-signal a fence: after
+//! device_wait_idle (swapchain recreation) all work is actually done, but a
+//! fence left in the reset state would hang the next wait forever.
 
 use anyhow::{Context, Result};
 
 use ash::vk;
 
-/// кадров в полёте (и слотов кольцевого буфера)
+/// frames in flight (and ring buffer slots)
 pub const FRAMES_IN_FLIGHT: usize = 8;
 
 pub struct FramesInFlight {
     fences: Vec<vk::Fence>,
     img_sems: Vec<vk::Semaphore>,
-    /// программная копия состояния fence (true = signaled или «работа завершена»)
+    /// software copy of fence state (true = signaled or "work complete")
     #[allow(dead_code)]
     signaled: Vec<bool>,
     index: usize,
@@ -71,8 +71,8 @@ impl FramesInFlight {
         &self.img_sems[slot]
     }
 
-    /// Ждёт fence слота, если тот ещё в полёте. Сам fence НЕ сбрасывается —
-    /// сброс происходит непосредственно перед submit (`reset_for_submit`).
+    /// Wait for the slot fence if still in flight. The fence itself is NOT
+    /// reset here — reset happens right before submit (`reset_for_submit`).
     pub unsafe fn ensure_idle(&mut self, device: &ash::Device, slot: usize) -> Result<()> {
         if !self.signaled[slot] {
             device
@@ -83,8 +83,8 @@ impl FramesInFlight {
         Ok(())
     }
 
-    /// Ждёт все кадры в полёте. С кольцевым per-frame буфером для записи вершин
-    /// не нужен; оставлен для будущих случаев «перезаписать всё».
+    /// Wait for all in-flight frames. Not needed with the per-frame ring
+    /// vertex buffer; kept for future "rewrite everything" cases.
     #[allow(dead_code)]
     pub unsafe fn wait_all(&mut self, device: &ash::Device) -> Result<()> {
         let pending: Vec<vk::Fence> = self
@@ -106,7 +106,7 @@ impl FramesInFlight {
         Ok(())
     }
 
-    /// Сброс fence непосредственно перед queue_submit.
+    /// Reset the fence right before queue_submit.
     pub unsafe fn reset_for_submit(&mut self, device: &ash::Device, slot: usize) -> Result<()> {
         device
             .reset_fences(&[self.fences[slot]])
@@ -115,7 +115,8 @@ impl FramesInFlight {
         Ok(())
     }
 
-    /// После device_wait_idle: всё завершено, все fence «логически signaled».
+    /// After device_wait_idle: everything is complete, all fences are
+    /// "logically signaled".
     pub fn on_idle(&mut self) {
         for s in self.signaled.iter_mut() {
             *s = true;

@@ -1,4 +1,4 @@
-//! Обёртка над SDL3-окном: создание, события, fullscreen-режим.
+//! SDL3 window wrapper: creation, fullscreen mode.
 
 use anyhow::{anyhow, Result};
 use std::ffi::{c_int, c_void, CStr, CString};
@@ -11,11 +11,13 @@ pub struct Window {
 }
 
 impl Window {
-    /// Создаёт скрытое окно, ставит эксклюзивный fullscreen-режим дисплея
-    /// до показа (без перехода windowed -> fullscreen).
-    /// Важно: БЕЗ SDL_WINDOW_RESIZABLE — иначе Windows уводит свопчейн
-    /// с эксклюзивного flip-пути в композицию DWM (fps 6.6k -> 2.8k).
+    /// Creates a hidden window, sets an exclusive fullscreen display mode
+    /// before showing (no windowed -> fullscreen transition).
+    /// Important: NO SDL_WINDOW_RESIZABLE — otherwise Windows drops the
+    /// swapchain off exclusive flip into DWM composition (6.6k -> 2.8k fps).
     pub unsafe fn new(title: &str, w: c_int, h: c_int) -> Result<Self> {
+        // SDL_INIT_GAMEPAD needs the sdl-joystick feature of sdl3-sys
+        // (SDL is built with no-default-subsystems, see Cargo.toml)
         if !SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD) {
             return Err(sdl_err("SDL_Init"));
         }
@@ -65,7 +67,6 @@ impl Window {
                 ptr::null_mut::<c_void>(),
             );
             if hwnd.is_null() {
-                // без HWND двигаться нельзя
                 panic!("SDL_GetPointerProperty(HWND) = null");
             }
             hwnd

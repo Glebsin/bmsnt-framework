@@ -1,10 +1,10 @@
-//! Рендерер: dynamic rendering (Vulkan 1.4 core), кольцевой per-frame
-//! vertex-буфер и предзаписанные командные буферы (по одному на изображение
-//! свопчейна).
+//! Renderer: dynamic rendering (Vulkan 1.4 core), per-frame ring vertex
+//! buffer, pre-recorded command buffers (one per swapchain image).
 //!
-//! Кольцевой буфер: один аллокейшен, разрезанный на FRAMES_IN_FLIGHT слотов;
-//! слот s читает только CB кадра, отправленного на слоте s, и слот
-//! переиспользуется только после ensure_idle -> wait_all перед записью не нужен.
+//! Ring buffer: a single allocation cut into FRAMES_IN_FLIGHT slots; slot s
+//! is read only by the CB of the frame submitted on slot s, and a slot is
+//! reused only after ensure_idle — so wait_all before vertex writes is not
+//! needed.
 
 use anyhow::{anyhow, Result};
 use std::ffi::c_void;
@@ -16,9 +16,9 @@ use super::device::GfxContext;
 use super::swapchain::Swapchain;
 use crate::ui::text::Vertex;
 
-/// верх на слот кольцевого буфера — единый источник правды с ui::text
+/// per-slot vertex limit — shares the source of truth with ui::text
 pub const MAX_VERTS: usize = crate::ui::text::MAX_VERTS;
-/// слотов в кольце = кадров в полёте
+/// ring slots = frames in flight
 const RING_SLOTS: usize = super::frames::FRAMES_IN_FLIGHT;
 
 pub struct Renderer {
@@ -30,9 +30,9 @@ pub struct Renderer {
     vbuf: vk::Buffer,
     vmem: vk::DeviceMemory,
     vmap: *mut Vertex,
-    /// вершины текущего текста (для перезаписи слотов при dirty)
+    /// current text vertices (to re-upload ring slots when dirty)
     verts: Vec<Vertex>,
-    // зависящие от свопчейна
+    // swapchain-dependent
     views: Vec<vk::ImageView>,
     cmds: Vec<vk::CommandBuffer>,
     cb_dirty: Vec<bool>,
@@ -41,12 +41,12 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    /// Всё, что не зависит от свопчейна.
+    /// Everything that does not depend on the swapchain.
     pub unsafe fn new(ctx: &GfxContext) -> Result<Self> {
         let device = ctx.device();
         let queue_family = ctx.queue_family;
 
-        // --- пайплайн (dynamic rendering: без render pass) ---
+        // --- pipeline (dynamic rendering: no render pass) ---
         let spv: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shader.spv"));
         let code = u32_slice(spv);
         let sm_info = vk::ShaderModuleCreateInfo {
@@ -143,7 +143,7 @@ impl Renderer {
             .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)
             .map_err(|e| anyhow!("pipeline layout: {e:?}"))?;
 
-        // dynamic rendering: форматы color attachment'ов через p_next
+        // dynamic rendering: color attachment formats via p_next
         let mut rendering_create = vk::PipelineRenderingCreateInfo {
             color_attachment_count: 1,
             p_color_attachment_formats: &vk::Format::B8G8R8A8_UNORM,
@@ -168,7 +168,7 @@ impl Renderer {
             .map_err(|e| anyhow!("create_graphics_pipelines: {e:?}"))?;
         let pipeline = pipelines[0];
 
-        // --- командный пул ---
+        // --- command pool ---
         let cp_info = vk::CommandPoolCreateInfo {
             queue_family_index: queue_family,
             flags: vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
@@ -178,7 +178,7 @@ impl Renderer {
             .create_command_pool(&cp_info, None)
             .map_err(|e| anyhow!("cmd pool: {e:?}"))?;
 
-        // --- кольцевой host-visible vertex-буфер: слот на кадр в полёте ---
+        // --- ring host-visible vertex buffer: one slot per frame in flight ---
         let slice = (MAX_VERTS * std::mem::size_of::<Vertex>()) as u64;
         let buf_size = slice * RING_SLOTS as u64;
         let vb_info = vk::BufferCreateInfo {
@@ -228,10 +228,10 @@ impl Renderer {
         })
     }
 
-    /// Объекты, зависящие от свопчейна: views, командные буферы, viewport/scissor.
-    /// Вызывается при создании и при каждом пересоздании.
+    /// Swapchain-dependent objects: views, command buffers, viewport/scissor.
+    /// Called on creation and on every recreation.
     pub unsafe fn create_swapchain_objects(&mut self, device: &ash::Device, sc: &Swapchain) -> Result<()> {
-        // перезаписываемые командные буферы: по одному на изображение
+        // reset-able command buffers: one per image
         if !self.cmds.is_empty() {
             device.free_command_buffers(self.cmd_pool, &self.cmds);
             self.cmds.clear();
@@ -287,7 +287,7 @@ impl Renderer {
         Ok(())
     }
 
-    /// Уничтожение зависящих от свопчейна объектов (перед пересозданием/выходом).
+    /// Destroy swapchain-dependent objects (before recreation/exit).
     pub unsafe fn destroy_swapchain_objects(&mut self, device: &ash::Device) {
         if !self.cmds.is_empty() {
             device.free_command_buffers(self.cmd_pool, &self.cmds);
@@ -299,9 +299,9 @@ impl Renderer {
         }
     }
 
-    /// Копирование вершин в ВСЕ слоты кольцевого буфера. CB изображения
-    /// записывается при его acquire и биндит слот того кадра — поэтому каждый
-    /// слот обязан содержать актуальные вершины (8 копий ~5 КБ — копейки).
+    /// Copy vertices into EVERY ring slot. An image's CB is recorded at its
+    /// acquire and binds the current frame's slot — so every slot must hold
+    /// the current vertices (8 copies of ~5 KB is nothing).
     pub unsafe fn upload_verts(&mut self, verts: &[Vertex]) {
         assert!(verts.len() <= MAX_VERTS);
         for slot in 0..RING_SLOTS {
@@ -328,8 +328,8 @@ impl Renderer {
         &self.cmds[img_idx]
     }
 
-    /// Запись командного буфера изображения (если dirty).
-    /// `slot` — слот кольцевого буфера этого кадра.
+    /// Record the image's command buffer (if dirty). `slot` — this frame's
+    /// ring slot.
     pub unsafe fn record(
         &mut self,
         device: &ash::Device,
@@ -348,7 +348,7 @@ impl Renderer {
             .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
             .expect("begin cmd");
 
-        // dynamic rendering: begin/end rendering вместо render pass + framebuffer
+        // dynamic rendering: begin/end rendering instead of a render pass
         let clear_vals = [vk::ClearValue {
             color: vk::ClearColorValue {
                 float32: [0.0, 0.0, 0.0, 1.0],
@@ -373,7 +373,7 @@ impl Renderer {
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
         device.cmd_set_viewport(cmd, 0, &[self.viewport]);
         device.cmd_set_scissor(cmd, 0, &[self.scissor]);
-        // слот кольцевого буфера через смещение при bind
+        // ring slot is selected by the bind offset
         let slot_off = (slot * MAX_VERTS * std::mem::size_of::<Vertex>()) as vk::DeviceSize;
         device.cmd_bind_vertex_buffers(cmd, 0, &[self.vbuf], &[slot_off]);
         if !self.verts.is_empty() {

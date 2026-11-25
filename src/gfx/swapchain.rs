@@ -1,5 +1,5 @@
-//! Свопчейн: глубокая очередь (min+5, кламп до max), IMMEDIATE, per-image
-//! done-семафоры. Пересоздаётся при OUT_OF_DATE/resize.
+//! Swapchain: deep queue (min+5, clamped to max), IMMEDIATE, per-image
+//! done semaphores. Recreated on OUT_OF_DATE.
 
 use anyhow::{anyhow, Result};
 use std::ptr;
@@ -8,27 +8,27 @@ use ash::vk;
 
 use super::device::GfxContext;
 
-/// Результат vkAcquireNextImageKHR.
+/// vkAcquireNextImageKHR result.
 pub enum Acquire {
     Image(u32),
-    /// VK_NOT_READY — на Windows+IMMEDIATE драйвер иногда возвращает его
-    /// даже при бесконечном таймауте; достаточно повторить вызов.
+    /// VK_NOT_READY — the Windows+IMMEDIATE driver sometimes returns it even
+    /// with an infinite timeout; just retry.
     NotReady,
-    /// VK_ERROR_OUT_OF_DATE_KHR — нужен пересоздание свопчейна.
+    /// VK_ERROR_OUT_OF_DATE_KHR — recreate the swapchain.
     OutOfDate,
 }
 
 pub struct Swapchain {
     handle: vk::SwapchainKHR,
-    /// указатель на таблицу функций swapchain; живёт в GfxContext, который
-    /// переживает свопчейн
+    /// swapchain function-table pointer; the table lives in GfxContext,
+    /// which outlives the swapchain
     fp: *const ash::khr::swapchain::DeviceFn,
     pub images: Vec<vk::Image>,
-    /// done-семафоры: по одному на ИЗОБРАЖЕНИЕ свопчейна, не на кадр в полёте.
-    /// Fence гарантирует только завершение queue_submit, а present ждёт семафор
-    /// в presentation engine. Изображение возвращается через acquire только после
-    /// завершения его показа, поэтому семафор изображения безопасно
-    /// пересигналить не раньше, чем acquire снова выдал это изображение.
+    /// done semaphores: one per SWAPCHAIN IMAGE, not per frame in flight.
+    /// A fence only guarantees the end of queue_submit; present waits on the
+    /// semaphore inside the presentation engine. The image comes back through
+    /// acquire only after its presentation finishes, so its semaphore must not
+    /// be re-signaled earlier than acquire hands the image out again.
     done_sems: Vec<vk::Semaphore>,
     pub format: vk::Format,
     pub extent: vk::Extent2D,
@@ -141,7 +141,7 @@ impl Swapchain {
         })
     }
 
-    /// vkAcquireNextImageKHR с бесконечным таймаутом и семафором кадра.
+    /// vkAcquireNextImageKHR with an infinite timeout and the frame semaphore.
     pub unsafe fn acquire(&self, device: &ash::Device, img_sem: vk::Semaphore) -> Result<Acquire> {
         let mut idx = 0u32;
         let r = ((*self.fp).acquire_next_image_khr)(
@@ -160,7 +160,7 @@ impl Swapchain {
         })
     }
 
-    /// vkQueuePresentKHR; OUT_OF_DATE возвращает как Err(vk::Result) для пересоздания.
+    /// vkQueuePresentKHR; OUT_OF_DATE is returned as Err(vk::Result) for recreation.
     pub unsafe fn present(
         &self,
         queue: vk::Queue,
@@ -203,7 +203,7 @@ impl Swapchain {
     }
 }
 
-/// Двухшаговый запрос массива (сначала количество, потом данные).
+/// Two-step array query (count first, then data).
 pub unsafe fn query_vec<T>(
     mut call: impl FnMut(*mut u32, *mut T) -> vk::Result,
 ) -> Vec<T> {

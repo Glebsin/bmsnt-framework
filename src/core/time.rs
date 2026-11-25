@@ -1,9 +1,9 @@
-//! Тайминги и статистика кадра.
+//! Frame timing and statistics.
 
 use std::time::Instant;
 
-/// первые N мс не учитываем: инициализация пути презентации и переходные
-/// процессы частоты GPU портят статистику
+/// first N ms are ignored: presentation-path init and GPU clock transitions
+/// would skew the stats
 pub const WARMUP_MS: u64 = 2000;
 
 #[derive(Default)]
@@ -16,7 +16,7 @@ pub struct FrameStats {
     pub t_events: u128,
     pub acq_calls: u32,
     pub acq_retries: u32,
-    /// present через композицию DWM вместо эксклюзивного flip (детектор ниже)
+    /// present went through DWM composition instead of exclusive flip
     pub flip_lost: bool,
     frame_us: Vec<u32>,
     t_frame: Option<Instant>,
@@ -33,7 +33,7 @@ impl FrameStats {
         }
     }
 
-    /// конец кадра: замер полного оборота
+    /// end of frame: measure the full turn
     pub fn end_frame(&mut self) {
         if let Some(t) = self.t_frame.take() {
             self.frame_us
@@ -43,7 +43,7 @@ impl FrameStats {
         self.frames_in_window += 1;
     }
 
-    /// Печать статистики за окно длительностью `window_ms`; возвращает (fps, ms/кадр).
+    /// Print stats for a `window_ms` window; returns (fps, ms/frame).
     pub fn report(&mut self, window_ms: u64) -> (i64, f64) {
         let frames = self.frames_in_window;
         let n = frames.max(1) as f64;
@@ -57,7 +57,7 @@ impl FrameStats {
                 sorted[((sorted.len() as f64 * p).min((sorted.len() - 1) as f64)) as usize]
             }
         };
-        // 1%/0.1% lows: время худших 1%/0.1% кадров (в мс, как принято)
+        // 1%/0.1% lows: time of the worst 1%/0.1% of frames, in ms
         let low = |frac: f64| -> f64 {
             if sorted.is_empty() {
                 0.0
@@ -67,14 +67,14 @@ impl FrameStats {
             }
         };
 
-        // Диагностика пути презентации: на эксклюзивном flip present стоит
-        // ~110-130 us CPU; если стабильно < 80 us — кадры идут через композицию
-        // DWM (flip потерян: оверлей/перекрытие/HDR/настройки драйвера),
-        // что даёт просадки до ~3k fps при прочих равных.
+        // presentation-path detector: on exclusive flip present costs
+        // ~110-130 us CPU; consistently < 80 us means frames go through DWM
+        // composition (flip lost: overlay/occlusion/HDR/driver settings),
+        // which caps fps at ~3k everything else being equal.
         let present_us = self.t_present as f64 / n / 1000.0;
         let flip_note = if self.t_present > 0 && present_us < 80.0 && fps > 1000 {
             self.flip_lost = true;
-            "  << !! FLIP LOST: present через композицию DWM >>"
+            "  << !! FLIP LOST: present via DWM composition >>"
         } else {
             self.flip_lost = false;
             ""

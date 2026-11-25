@@ -1,4 +1,4 @@
-//! Контекст: instance, surface, устройство, очередь. Владеет Vulkan-загрузчиком.
+//! Vulkan context: instance, surface, device, queue. Owns the loader.
 
 use anyhow::{anyhow, Result};
 use std::ffi::{c_void, CStr};
@@ -8,7 +8,7 @@ use ash::vk;
 use ash::{Entry, Instance};
 
 pub struct GfxContext {
-    /// держит живым загрузчик Vulkan; не удалять
+    /// keeps the Vulkan loader alive; must not be dropped early
     #[allow(dead_code)]
     entry: Entry,
     instance: Instance,
@@ -22,7 +22,7 @@ pub struct GfxContext {
 }
 
 impl GfxContext {
-    /// hwnd — HWND окна (Win32).
+    /// `hwnd` — Win32 window handle.
     pub unsafe fn new(hwnd: *mut c_void) -> Result<Self> {
         let entry = Entry::load().map_err(|e| anyhow!("vulkan loader: {e:?}"))?;
 
@@ -48,7 +48,7 @@ impl GfxContext {
             .map_err(|e| anyhow!("create_instance: {e:?}"))?;
         crate::elog!("instance created");
 
-        // --- поверхность ---
+        // --- surface ---
         let hinstance =
             windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(ptr::null());
         if hinstance.is_null() {
@@ -78,7 +78,7 @@ impl GfxContext {
 
         let surface_instance = ash::khr::surface::Instance::load(&entry, &instance);
 
-        // --- устройство: первый с graphics+present ---
+        // --- device: first one with graphics+present ---
         let devices = instance
             .enumerate_physical_devices()
             .map_err(|e| anyhow!("enumerate_physical_devices: {e:?}"))?;
@@ -124,9 +124,8 @@ impl GfxContext {
             ..Default::default()
         };
         let dev_exts = [c"VK_KHR_swapchain".as_ptr()];
-        // dynamicRendering — core-фича, но по спеке её нужно ЯВНО включить
-        // через Vulkan13Features (по умолчанию false; драйвер может не проверить,
-        // validation layer — проверит)
+        // dynamicRendering is core in 1.3 but must be enabled EXPLICITLY via
+        // Vulkan13Features (validation checks it, the driver may not)
         let mut vulkan13_features = vk::PhysicalDeviceVulkan13Features {
             dynamic_rendering: vk::TRUE,
             ..Default::default()
@@ -178,8 +177,8 @@ impl GfxContext {
         &self.swapchain_loader
     }
 
-    /// Полное разрушение: device -> surface -> instance. Вызывать после того,
-    /// как всё остальное (renderer/swapchain/frames) уже уничтожено и idle.
+    /// Full teardown: device -> surface -> instance. Call after everything
+    /// else (renderer/swapchain/frames) is destroyed and idle.
     pub unsafe fn destroy(self) {
         self.device.destroy_device(None);
         (self.surface_instance.fp().destroy_surface_khr)(

@@ -1,11 +1,10 @@
-//! NVML: лок максимальной доступной частоты GPU.
+//! NVML: lock the GPU clock to the driver max.
 //!
-//! nvml.dll идёт с драйвером NVIDIA (System32). Лок требует прав администратора
-//! (манифест requireAdministrator). Сброс при выходе.
+//! nvml.dll ships with the NVIDIA driver (System32). The lock requires admin
+//! rights; reset on exit (Drop). Note: the log/error strings are in English.
 
 use anyhow::{anyhow, Result};
 use std::ffi::c_char;
-use std::ptr;
 
 use windows_sys::Win32::Foundation::HMODULE;
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
@@ -29,7 +28,7 @@ pub struct Nvml {
 }
 
 impl Nvml {
-    /// Инициализация NVML + лок частоты GPU на максимум, доступный драйверу.
+    /// Init NVML and lock the GPU clock to the driver max.
     pub unsafe fn init_and_lock_max() -> Result<Self> {
         let lib = LoadLibraryA(b"nvml.dll\0".as_ptr());
         let lib = if lib.is_null() {
@@ -38,7 +37,7 @@ impl Nvml {
             lib
         };
         if lib.is_null() {
-            return Err(anyhow!("nvml.dll не найдена"));
+            return Err(anyhow!("nvml.dll not found"));
         }
 
         let get = |name: &[u8]| -> usize {
@@ -50,18 +49,18 @@ impl Nvml {
 
         let init: FnInit = unsafe { std::mem::transmute(get(b"nvmlInit_v2\0")) };
         if get(b"nvmlInit_v2\0") == 0 {
-            return Err(anyhow!("nvmlInit_v2 нет"));
+            return Err(anyhow!("nvmlInit_v2 missing"));
         }
         let get_handle: FnGetHandle = unsafe { std::mem::transmute(get(b"nvmlDeviceGetHandleByIndex_v2\0")) };
         if get(b"nvmlDeviceGetHandleByIndex_v2\0") == 0 {
-            return Err(anyhow!("nvmlDeviceGetHandleByIndex_v2 нет"));
+            return Err(anyhow!("nvmlDeviceGetHandleByIndex_v2 missing"));
         }
         let get_max: FnGetMaxClock = unsafe { std::mem::transmute(get(b"nvmlDeviceGetMaxClockInfo\0")) };
         if get(b"nvmlDeviceGetMaxClockInfo\0") == 0 {
-            return Err(anyhow!("nvmlDeviceGetMaxClockInfo нет"));
+            return Err(anyhow!("nvmlDeviceGetMaxClockInfo missing"));
         }
         if get(b"nvmlDeviceSetGpuLockedClocks\0") == 0 {
-            return Err(anyhow!("nvmlDeviceSetGpuLockedClocks нет"));
+            return Err(anyhow!("nvmlDeviceSetGpuLockedClocks missing"));
         }
         let set_locked: FnSetLockedClocks = unsafe { std::mem::transmute(get(b"nvmlDeviceSetGpuLockedClocks\0")) };
         let reset_locked: Option<FnResetLockedClocks> = if get(b"nvmlDeviceResetGpuLockedClocks\0") != 0 {
@@ -70,7 +69,7 @@ impl Nvml {
             None
         };
         if get(b"nvmlDeviceGetName\0") == 0 {
-            return Err(anyhow!("nvmlDeviceGetName нет"));
+            return Err(anyhow!("nvmlDeviceGetName missing"));
         }
         let get_name: FnGetName = unsafe { std::mem::transmute(get(b"nvmlDeviceGetName\0")) };
 
@@ -104,7 +103,7 @@ impl Nvml {
         let r = set_locked(handle, max_mhz, max_mhz);
         if r != 0 {
             return Err(anyhow!(
-                "nvmlDeviceSetGpuLockedClocks({max_mhz}) = {r} (нужны права администратора)"
+                "nvmlDeviceSetGpuLockedClocks({max_mhz}) = {r} (admin rights required)"
             ));
         }
 
@@ -118,7 +117,7 @@ impl Nvml {
         })
     }
 
-    /// Смена лока (для будущего «ультимативного режима» из настроек).
+    /// Change the lock (for a future "ultimate mode" setting).
     #[allow(dead_code)]
     pub unsafe fn set_clock(&self, mhz: u32) -> Result<()> {
         let r = (self.fn_set_locked)(self.handle, mhz, mhz);
@@ -128,14 +127,13 @@ impl Nvml {
         Ok(())
     }
 
-    /// Сброс лока — вызывать при выходе.
+    /// Reset the lock — call on exit (Drop does it).
     pub unsafe fn reset(&self) {
+        // older NVML may lack the reset function; then the driver lifts the
+        // lock itself when the process exits
         if let Some(reset) = self.fn_reset_locked {
             let _ = reset(self.handle);
         }
-        // reset-функции может не быть в старых NVML — тогда лок снимается
-        // самим драйвером после завершения процесса
-        let _ = ptr::null_mut::<c_char>();
     }
 }
 
