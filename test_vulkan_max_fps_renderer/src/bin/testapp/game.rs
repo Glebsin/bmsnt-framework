@@ -164,6 +164,7 @@ impl Game {
         let mut flip_lost = false;
         let mut last = Instant::now();
         let mut update_acc = 0.0f64;
+        let mut shot_done = false;
 
         'main: while running {
             if !self.poll_input()? {
@@ -356,6 +357,16 @@ impl Game {
                 } else {
                     self.stats.reset_window();
                     self.stats.window_start = now;
+                }
+            }
+
+            // diagnostics: auto-screenshot at N seconds (TESTAPP_SHOT_SECS)
+            if let Ok(secs) = std::env::var("TESTAPP_SHOT_SECS") {
+                if let Ok(ms) = secs.parse::<u64>() {
+                    if !shot_done && now - start_ticks >= ms * 1000 {
+                        self.renderer.request_screenshot();
+                        shot_done = true;
+                    }
                 }
             }
 

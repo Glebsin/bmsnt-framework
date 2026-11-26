@@ -391,6 +391,11 @@ impl Renderer {
         self.shot_ready
     }
 
+    /// Byte size of the current text vertex payload.
+    pub fn vert_bytes(&self) -> u64 {
+        (self.verts.len() * std::mem::size_of::<Vertex>()) as u64
+    }
+
     /// True while a screenshot copy is still pending (not yet recorded).
     /// The caller must force CB re-record + upload this frame.
     pub fn shot_pending(&self) -> bool {
@@ -513,6 +518,7 @@ impl Renderer {
     }
 
     /// Same, with an optional sprite batch drawn first (under the text).
+    /// Frame time flows through the batcher's UBO, not through commands.
     pub unsafe fn record_frame(
         &mut self,
         device: &ash::Device,

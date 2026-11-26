@@ -145,6 +145,13 @@ impl FramesInFlight {
         }
     }
 
+    /// True when the slot has no work in flight (its fence is signaled or
+    /// soft-tracked as complete). A host write into an in-flight slot's
+    /// memory races the GPU vertex fetch and tears the data.
+    pub fn is_idle(&self, slot: usize) -> bool {
+        self.signaled[slot]
+    }
+
     pub fn advance(&mut self) {
         self.index = (self.index + 1) % self.fences.len();
     }

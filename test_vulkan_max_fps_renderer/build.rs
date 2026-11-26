@@ -33,8 +33,13 @@ fn main() {
     // Fallback: without rc.exe the build continues without the manifest.
     println!("cargo:rerun-if-changed=src/bin/testapp/testapp.manifest");
     println!("cargo:rerun-if-changed=src/bin/testapp/testapp.rc");
+    // measurement builds launched from a non-elevated automation session
+    // skip the manifest (env switch, not part of normal builds)
+    println!("cargo:rerun-if-env-changed=TESTAPP_NO_MANIFEST");
     let rc_script = "src/bin/testapp/testapp.rc";
-    if Path::new(rc_script).exists() {
+    if env::var("TESTAPP_NO_MANIFEST").is_ok() {
+        println!("cargo:warning=TESTAPP_NO_MANIFEST set: building testapp WITHOUT the admin manifest (measurement build only)");
+    } else if Path::new(rc_script).exists() {
         if let Some(rc) = find_rc() {
             let res = Path::new(&out_dir).join("testapp.res");
             let status = std::process::Command::new(&rc)
@@ -44,10 +49,15 @@ fn main() {
                 Ok(s) if s.success() => {
                     println!("cargo:rustc-link-arg-bin=testapp={}", res.to_str().unwrap());
                 }
-                _ => println!("cargo:warning=rc.exe failed; testapp built WITHOUT the admin manifest"),
+                _ => panic!(
+                    "rc.exe failed to compile testapp.rc; refusing to build testapp.exe without the admin manifest"
+                ),
             }
         } else {
-            println!("cargo:warning=rc.exe not found; testapp built WITHOUT the admin manifest");
+            panic!(
+                "rc.exe not found: cannot embed the requireAdministrator manifest into testapp.exe; \
+                 install the Windows SDK or set the RC env variable to the full path of rc.exe"
+            );
         }
     }
 }
