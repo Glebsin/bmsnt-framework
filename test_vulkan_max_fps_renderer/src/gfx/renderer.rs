@@ -33,6 +33,10 @@ pub struct Renderer {
     vmap: *mut Vertex,
     /// current text vertices (to re-upload ring slots when dirty)
     verts: Vec<Vertex>,
+    /// ring slots still waiting for their text-vertex upload: writing a slot
+    /// while the GPU reads it tears the data, so only idle slots are written
+    /// and the rest are retried on later frames (same scheme as the sprites)
+    text_pending: [bool; RING_SLOTS],
     // swapchain-dependent
     views: Vec<vk::ImageView>,
     cmds: Vec<vk::CommandBuffer>,
@@ -229,6 +233,7 @@ impl Renderer {
             vmem,
             vmap,
             verts: Vec::new(),
+            text_pending: [true; RING_SLOTS],
             views: Vec::new(),
             cmds: Vec::new(),
             cb_dirty: Vec::new(),
@@ -477,19 +482,29 @@ impl Renderer {
         }
     }
 
-    /// Copy vertices into EVERY ring slot. An image's CB is recorded at its
-    /// acquire and binds the current frame's slot — so every slot must hold
-    /// the current vertices (8 copies of ~5 KB is nothing).
+    /// Stage the new text vertices: the CPU-side copy is updated at once,
+    /// but the ring slots are written only by `upload_text_pending` for
+    /// slots NOT in flight (writing an in-flight slot races the GPU fetch).
     pub unsafe fn upload_verts(&mut self, verts: &[Vertex]) {
         assert!(verts.len() <= MAX_VERTS);
-        for slot in 0..RING_SLOTS {
-            let base = self.vmap.add(slot * MAX_VERTS);
-            for (n, v) in verts.iter().enumerate() {
-                ptr::copy_nonoverlapping(v, base.add(n), 1);
-            }
-        }
         self.verts.clear();
         self.verts.extend_from_slice(verts);
+        self.text_pending = [true; RING_SLOTS];
+    }
+
+    /// Write the staged text vertices into every ring slot marked idle in
+    /// `idle` (true = no work in flight). In-flight slots are skipped and
+    /// retried on later frames.
+    pub unsafe fn upload_text_pending(&mut self, idle: &[bool; RING_SLOTS]) {
+        for slot in 0..RING_SLOTS {
+            if self.text_pending[slot] && idle[slot] {
+                let base = self.vmap.add(slot * MAX_VERTS);
+                for (n, v) in self.verts.iter().enumerate() {
+                    ptr::copy_nonoverlapping(v, base.add(n), 1);
+                }
+                self.text_pending[slot] = false;
+            }
+        }
     }
 
     pub fn mark_dirty(&mut self, img_idx: usize) {

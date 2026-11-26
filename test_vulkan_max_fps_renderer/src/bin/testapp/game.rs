@@ -13,6 +13,7 @@ use ash::vk;
 use vk5k::core::time::{FrameStats, WARMUP_MS};
 use vk5k::gfx::device::GfxContext;
 use vk5k::gfx::frames::FramesInFlight;
+use vk5k::gfx::frames::FRAMES_IN_FLIGHT;
 use vk5k::gfx::renderer::Renderer;
 use vk5k::gfx::sprite::SpriteBatcher;
 use vk5k::gfx::swapchain::{Acquire, Swapchain};
@@ -24,7 +25,6 @@ use crate::screens::{SpriteBatchScreen, TestCase};
 use crate::theme::{DESIGN_H, DESIGN_W};
 use crate::ui::{self, Layout, UiState};
 
-const FRAMES_IN_FLIGHT: usize = 8;
 const STATS_WINDOW_MS: u64 = 250;
 
 /// fixed-dt update stage (120 Hz)
@@ -77,6 +77,10 @@ struct Game {
     ui: UiState,
     screens: Vec<Box<dyn TestCase>>,
     stats: FrameStats,
+    /// instance ring slots still waiting for their (deferred) upload: a slot
+    /// must never be written while the GPU is reading it, so uploads land
+    /// only in idle slots (early in the frame, before any submit)
+    pending_upload: [bool; FRAMES_IN_FLIGHT],
     /// seconds since app start; drives the test scenes
     t_start: Instant,
     /// previous frame signature for idle-change detection
@@ -141,6 +145,7 @@ impl Game {
             ui: UiState::from_env(),
             screens,
             stats: FrameStats::new(sdl3_sys::everything::SDL_GetTicks()),
+            pending_upload: [true; FRAMES_IN_FLIGHT],
             t_start: Instant::now(),
             last_sig: None,
             no_sprites: std::env::var("TESTAPP_NOSPRITES").is_ok(),
@@ -204,6 +209,21 @@ impl Game {
                 vk5k::elog!("frame fence did not signal in 1 s — full rebuild");
                 self.full_rebuild()?;
                 continue 'main;
+            }
+
+            // EARLY in the frame: drain deferred uploads into every slot that
+            // became idle since the last frame — BEFORE acquire/record/submit,
+            // so a submitted CB can never read a slot with stale data (text
+            // flicker). Covers both the text vertices and the instances.
+            {
+                let mut idle = [false; FRAMES_IN_FLIGHT];
+                for i in 0..FRAMES_IN_FLIGHT {
+                    idle[i] = self.frames.is_idle(i);
+                }
+                unsafe {
+                    self.renderer.upload_text_pending(&idle);
+                    self.upload_instances_pending(&idle);
+                }
             }
 
             // --- acquire ---
@@ -278,9 +298,23 @@ impl Game {
                 self.ui_snap.extend_from_slice(self.sprites.instances());
 
                 let t0 = Instant::now();
-                self.renderer.upload_verts(&self.ui_verts);
+                unsafe {
+                    self.renderer.upload_verts(&self.ui_verts);
+                }
                 // static UI: identical data in every ring slot, so old CBs
-                // stay valid between updates
+                // stay valid between updates — but only idle slots may be
+                // written now (in-flight slots are retried early next frame)
+                self.pending_upload = [true; FRAMES_IN_FLIGHT];
+                {
+                    let mut idle = [false; FRAMES_IN_FLIGHT];
+                    for i in 0..FRAMES_IN_FLIGHT {
+                        idle[i] = self.frames.is_idle(i);
+                    }
+                    unsafe {
+                        self.renderer.upload_text_pending(&idle);
+                        self.upload_instances_pending(&idle);
+                    }
+                }
                 for s_i in 0..FRAMES_IN_FLIGHT {
                     self.sprites.upload_slot(self.ctx.device(), s_i);
                 }
@@ -307,7 +341,9 @@ impl Game {
                 // per-frame scene data: current slot only, every image's CB
                 // is re-recorded with it
                 let t0 = Instant::now();
-                self.sprites.upload_slot(self.ctx.device(), slot);
+                unsafe { self.sprites.upload_slot(self.ctx.device(), slot) };
+                // the current slot now holds the full up-to-date frame
+                self.pending_upload[slot] = false;
                 for i in 0..self.swapchain.image_count() {
                     self.renderer.mark_dirty(i);
                 }
@@ -388,6 +424,18 @@ impl Game {
         self.ctx.destroy();
         self.window.destroy();
         Ok(())
+    }
+
+    /// Write pending instance data into every ring slot that is NOT in
+    /// flight. In-flight slots are skipped and retried early next frame —
+    /// writing them while the GPU fetches their instances tears the data.
+    unsafe fn upload_instances_pending(&mut self, idle: &[bool; FRAMES_IN_FLIGHT]) {
+        for s_i in 0..FRAMES_IN_FLIGHT {
+            if self.pending_upload[s_i] && idle[s_i] {
+                self.sprites.upload_slot(self.ctx.device(), s_i);
+                self.pending_upload[s_i] = false;
+            }
+        }
     }
 
     /// Drain the event queue once per frame. Returns false when the app
@@ -587,6 +635,7 @@ impl Game {
     unsafe fn rebuild_device_stack(&mut self) -> Result<()> {
         self.ctx.recreate_device()?;
         self.frames = FramesInFlight::new(self.ctx.device(), FRAMES_IN_FLIGHT);
+        self.pending_upload = [true; FRAMES_IN_FLIGHT];
         self.sprites = SpriteBatcher::new(&self.ctx)?;
         self.swapchain = Swapchain::new(&self.ctx)?;
         self.renderer = Renderer::new(&self.ctx)?;

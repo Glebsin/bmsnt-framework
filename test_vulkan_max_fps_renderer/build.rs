@@ -30,15 +30,21 @@ fn main() {
     // NVML clock locking works on a normal double-click. Compiled with the
     // SDK resource compiler (rc.exe) and linked into testapp.exe via a
     // per-binary link arg (vk5k.exe stays without the elevation requirement).
-    // Fallback: without rc.exe the build continues without the manifest.
+    // A missing rc.exe is a hard error: the manifest is required for normal
+    // use; measurement builds may skip it with TESTAPP_NO_MANIFEST=1.
     println!("cargo:rerun-if-changed=src/bin/testapp/testapp.manifest");
     println!("cargo:rerun-if-changed=src/bin/testapp/testapp.rc");
     // measurement builds launched from a non-elevated automation session
     // skip the manifest (env switch, not part of normal builds)
     println!("cargo:rerun-if-env-changed=TESTAPP_NO_MANIFEST");
     let rc_script = "src/bin/testapp/testapp.rc";
-    if env::var("TESTAPP_NO_MANIFEST").is_ok() {
-        println!("cargo:warning=TESTAPP_NO_MANIFEST set: building testapp WITHOUT the admin manifest (measurement build only)");
+    if env::var("TESTAPP_NO_MANIFEST").as_deref() == Ok("1") {
+        println!("cargo:warning=TESTAPP_NO_MANIFEST=1: building testapp WITHOUT the admin manifest (measurement build only)");
+    } else if !Path::new(rc_script).exists() {
+        panic!(
+            "src/bin/testapp/testapp.rc is missing: cannot embed the requireAdministrator manifest; \
+             restore the file or build with TESTAPP_NO_MANIFEST=1"
+        );
     } else if Path::new(rc_script).exists() {
         if let Some(rc) = find_rc() {
             let res = Path::new(&out_dir).join("testapp.res");
