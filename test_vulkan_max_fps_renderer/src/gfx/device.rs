@@ -7,7 +7,8 @@ use std::ptr;
 use ash::vk;
 use ash::{Entry, Instance};
 
-pub struct GfxContext {    /// keeps the Vulkan loader alive; must not be dropped early
+pub struct GfxContext {
+    /// keeps the Vulkan loader alive; must not be dropped early
     #[allow(dead_code)]
     entry: Entry,
     instance: Instance,
@@ -18,6 +19,9 @@ pub struct GfxContext {    /// keeps the Vulkan loader alive; must not be droppe
     pub queue: vk::Queue,
     surface_instance: ash::khr::surface::Instance,
     swapchain_loader: ash::khr::swapchain::Device,
+    /// debug messenger, destroyed with the instance (leaking it makes VVL
+    /// flag vkDestroyInstance: child objects must be destroyed first)
+    debug_messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
 }
 
 /// Debug utils callback: validation messages go to the log file.
@@ -43,9 +47,10 @@ impl GfxContext {
     pub unsafe fn new(hwnd: *mut c_void) -> Result<Self> {
         let entry = Entry::load().map_err(|e| anyhow!("vulkan loader: {e:?}"))?;
 
-        // TESTAPP_VALIDATE=1 (or vk5k) enables the Khronos validation layer
+        // BMSNT_VALIDATE=1 (or bmsnt-framework) enables the Khronos validation layer
         // + debug utils; violations are logged via elog
         let validate = std::env::var("VALIDATE").is_ok();
+        let mut debug_messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)> = None;
         let mut layers: Vec<*const i8> = Vec::new();
         let mut inst_exts: Vec<*const i8> = vec![
             c"VK_KHR_surface".as_ptr(),
@@ -69,7 +74,7 @@ impl GfxContext {
                 crate::elog!("validation layer not installed");
             }
         }
-        let app_name = c"black-vk".as_ptr();
+        let app_name = c"bmsnt".as_ptr();
         let app = vk::ApplicationInfo {
             p_application_name: app_name,
             api_version: vk::API_VERSION_1_4,
@@ -87,10 +92,12 @@ impl GfxContext {
             .create_instance(&inst_info, None)
             .map_err(|e| anyhow!("create_instance: {e:?}"))?;
 
-        // debug messenger (only when validating)
-        if validate {
+        crate::elog!("instance created");
+
+        // debug messenger (only when validating with the layer installed)
+        if debug_messenger.is_none() && validate {
             let dbg = ash::ext::debug_utils::Instance::load(&entry, &instance);
-            let name = c"vk5k".as_ptr();
+            let name = c"bmsnt-framework".as_ptr();
             let info = vk::DebugUtilsMessengerCreateInfoEXT {
                 message_severity: vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
                     | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
@@ -103,14 +110,8 @@ impl GfxContext {
             };
             let messenger = unsafe { dbg.create_debug_utils_messenger(&info, None) }
                 .map_err(|e| anyhow!("debug messenger: {e:?}"))?;
-            // the raw handle is intentionally never destroyed: the callback
-            // must stay alive until process shutdown (one instance per run);
-            // the loader struct is kept alive the same way
-            let _ = messenger;
-            std::mem::forget(dbg);
-            let _ = instance.handle();
+            debug_messenger = Some((dbg, messenger));
         }
-        crate::elog!("instance created");
 
         // --- surface ---
         let hinstance =
@@ -218,6 +219,7 @@ impl GfxContext {
             queue,
             surface_instance,
             swapchain_loader,
+            debug_messenger,
         })
     }
 
@@ -257,7 +259,10 @@ impl GfxContext {
 
     /// Full teardown: device -> surface -> instance. Call after everything
     /// else (renderer/swapchain/frames) is destroyed and idle.
-    pub unsafe fn destroy(self) {
+    pub unsafe fn destroy(mut self) {
+        if let Some((dbg, messenger)) = self.debug_messenger.take() {
+            dbg.destroy_debug_utils_messenger(messenger, None);
+        }
         self.device.destroy_device(None);
         (self.surface_instance.fp().destroy_surface_khr)(
             self.instance.handle(),
@@ -272,7 +277,8 @@ impl GfxContext {
         instance: &Instance,
         pdevice: vk::PhysicalDevice,
         qfi: u32,
-    ) -> Result<ash::Device> {        let queue_priorities = [1.0f32];
+    ) -> Result<ash::Device> {
+        let queue_priorities = [1.0f32];
         let queue_info = vk::DeviceQueueCreateInfo {
             queue_family_index: qfi,
             queue_count: 1,

@@ -26,42 +26,42 @@ fn main() {
         println!("cargo:rerun-if-changed={src}");
     }
 
-    // Windows manifest for the testapp binary only: requireAdministrator so
+    // Windows manifest for the bmsnt_test_browser binary only: requireAdministrator so
     // NVML clock locking works on a normal double-click. Compiled with the
-    // SDK resource compiler (rc.exe) and linked into testapp.exe via a
-    // per-binary link arg (vk5k.exe stays without the elevation requirement).
+    // SDK resource compiler (rc.exe) and linked into bmsnt_test_browser.exe via a
+    // per-binary link arg (bmsnt-framework.exe stays without the elevation requirement).
     // A missing rc.exe is a hard error: the manifest is required for normal
-    // use; measurement builds may skip it with TESTAPP_NO_MANIFEST=1.
-    println!("cargo:rerun-if-changed=src/bin/testapp/testapp.manifest");
-    println!("cargo:rerun-if-changed=src/bin/testapp/testapp.rc");
+    // use; measurement builds may skip it with BMSNT_NO_MANIFEST=1.
+    println!("cargo:rerun-if-changed=src/bin/bmsnt_test_browser/bmsnt_test_browser.manifest");
+    println!("cargo:rerun-if-changed=src/bin/bmsnt_test_browser/bmsnt_test_browser.rc");
     // measurement builds launched from a non-elevated automation session
     // skip the manifest (env switch, not part of normal builds)
-    println!("cargo:rerun-if-env-changed=TESTAPP_NO_MANIFEST");
-    let rc_script = "src/bin/testapp/testapp.rc";
-    if env::var("TESTAPP_NO_MANIFEST").as_deref() == Ok("1") {
-        println!("cargo:warning=TESTAPP_NO_MANIFEST=1: building testapp WITHOUT the admin manifest (measurement build only)");
+    println!("cargo:rerun-if-env-changed=BMSNT_NO_MANIFEST");
+    let rc_script = "src/bin/bmsnt_test_browser/bmsnt_test_browser.rc";
+    if env::var("BMSNT_NO_MANIFEST").as_deref() == Ok("1") {
+        println!("cargo:warning=BMSNT_NO_MANIFEST=1: building bmsnt_test_browser WITHOUT the admin manifest (measurement build only)");
     } else if !Path::new(rc_script).exists() {
         panic!(
-            "src/bin/testapp/testapp.rc is missing: cannot embed the requireAdministrator manifest; \
-             restore the file or build with TESTAPP_NO_MANIFEST=1"
+            "src/bin/bmsnt_test_browser/bmsnt_test_browser.rc is missing: cannot embed the requireAdministrator manifest; \
+             restore the file or build with BMSNT_NO_MANIFEST=1"
         );
     } else if Path::new(rc_script).exists() {
         if let Some(rc) = find_rc() {
-            let res = Path::new(&out_dir).join("testapp.res");
+            let res = Path::new(&out_dir).join("bmsnt_test_browser.res");
             let status = std::process::Command::new(&rc)
                 .args(["/nologo", "/fo", res.to_str().unwrap(), rc_script])
                 .status();
             match status {
                 Ok(s) if s.success() => {
-                    println!("cargo:rustc-link-arg-bin=testapp={}", res.to_str().unwrap());
+                    println!("cargo:rustc-link-arg-bin=bmsnt_test_browser={}", res.to_str().unwrap());
                 }
                 _ => panic!(
-                    "rc.exe failed to compile testapp.rc; refusing to build testapp.exe without the admin manifest"
+                    "rc.exe failed to compile bmsnt_test_browser.rc; refusing to build bmsnt_test_browser.exe without the admin manifest"
                 ),
             }
         } else {
             panic!(
-                "rc.exe not found: cannot embed the requireAdministrator manifest into testapp.exe; \
+                "rc.exe not found: cannot embed the requireAdministrator manifest into bmsnt_test_browser.exe; \
                  install the Windows SDK or set the RC env variable to the full path of rc.exe"
             );
         }

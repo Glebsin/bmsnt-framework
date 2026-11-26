@@ -33,13 +33,13 @@ pub struct Renderer {
     vmap: *mut Vertex,
     /// current text vertices (to re-upload ring slots when dirty)
     verts: Vec<Vertex>,
-    /// ring slots still waiting for their text-vertex upload: writing a slot
-    /// while the GPU reads it tears the data, so only idle slots are written
-    /// and the rest are retried on later frames (same scheme as the sprites)
-    text_pending: [bool; RING_SLOTS],
     // swapchain-dependent
     views: Vec<vk::ImageView>,
     cmds: Vec<vk::CommandBuffer>,
+    /// one fence per image: signals when that image's previous submit has
+    /// fully completed — a CB must not be reset/re-recorded while still in
+    /// flight (IMMEDIATE present does not throttle acquire)
+    img_fences: Vec<vk::Fence>,
     cb_dirty: Vec<bool>,
     viewport: vk::Viewport,
     scissor: vk::Rect2D,
@@ -233,9 +233,9 @@ impl Renderer {
             vmem,
             vmap,
             verts: Vec::new(),
-            text_pending: [true; RING_SLOTS],
             views: Vec::new(),
             cmds: Vec::new(),
+            img_fences: Vec::new(),
             cb_dirty: Vec::new(),
             viewport: vk::Viewport::default(),
             scissor: vk::Rect2D::default(),
@@ -268,6 +268,23 @@ impl Renderer {
             .allocate_command_buffers(&cb_alloc)
             .map_err(|e| anyhow!("allocate cmds: {e:?}"))?;
         self.cb_dirty = vec![true; sc.image_count()];
+        // per-image fences, created SIGNALED (an image's first record has no
+        // previous submit to wait for)
+        for old in self.img_fences.drain(..) {
+            device.destroy_fence(old, None);
+        }
+        for _ in 0..sc.image_count() {
+            let f = device
+                .create_fence(
+                    &vk::FenceCreateInfo {
+                        flags: vk::FenceCreateFlags::SIGNALED,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .map_err(|e| anyhow!("img fence: {e:?}"))?;
+            self.img_fences.push(f);
+        }
 
         for old in self.views.drain(..) {
             device.destroy_image_view(old, None);
@@ -396,11 +413,6 @@ impl Renderer {
         self.shot_ready
     }
 
-    /// Byte size of the current text vertex payload.
-    pub fn vert_bytes(&self) -> u64 {
-        (self.verts.len() * std::mem::size_of::<Vertex>()) as u64
-    }
-
     /// True while a screenshot copy is still pending (not yet recorded).
     /// The caller must force CB re-record + upload this frame.
     pub fn shot_pending(&self) -> bool {
@@ -468,6 +480,9 @@ impl Renderer {
             self.cmds.clear();
         }
         self.cb_dirty.clear();
+        for f in self.img_fences.drain(..) {
+            device.destroy_fence(f, None);
+        }
         for v in self.views.drain(..) {
             device.destroy_image_view(v, None);
         }
@@ -482,29 +497,19 @@ impl Renderer {
         }
     }
 
-    /// Stage the new text vertices: the CPU-side copy is updated at once,
-    /// but the ring slots are written only by `upload_text_pending` for
-    /// slots NOT in flight (writing an in-flight slot races the GPU fetch).
+    /// Copy vertices into EVERY ring slot. An image's CB is recorded at its
+    /// acquire and binds the current frame's slot — so every slot must hold
+    /// the current vertices (8 copies of ~5 KB is nothing).
     pub unsafe fn upload_verts(&mut self, verts: &[Vertex]) {
         assert!(verts.len() <= MAX_VERTS);
-        self.verts.clear();
-        self.verts.extend_from_slice(verts);
-        self.text_pending = [true; RING_SLOTS];
-    }
-
-    /// Write the staged text vertices into every ring slot marked idle in
-    /// `idle` (true = no work in flight). In-flight slots are skipped and
-    /// retried on later frames.
-    pub unsafe fn upload_text_pending(&mut self, idle: &[bool; RING_SLOTS]) {
         for slot in 0..RING_SLOTS {
-            if self.text_pending[slot] && idle[slot] {
-                let base = self.vmap.add(slot * MAX_VERTS);
-                for (n, v) in self.verts.iter().enumerate() {
-                    ptr::copy_nonoverlapping(v, base.add(n), 1);
-                }
-                self.text_pending[slot] = false;
+            let base = self.vmap.add(slot * MAX_VERTS);
+            for (n, v) in verts.iter().enumerate() {
+                ptr::copy_nonoverlapping(v, base.add(n), 1);
             }
         }
+        self.verts.clear();
+        self.verts.extend_from_slice(verts);
     }
 
     pub fn mark_dirty(&mut self, img_idx: usize) {
@@ -515,6 +520,18 @@ impl Renderer {
 
     pub fn is_dirty(&self, img_idx: usize) -> bool {
         self.cb_dirty[img_idx]
+    }
+
+    /// Enqueue an empty submit signaling the image's fence: the fence fires
+    /// after ALL earlier queue work (this frame's real submit included) has
+    /// completed, so the next reset/record of this image's CB is safe.
+    pub unsafe fn signal_image_fence(&self, device: &ash::Device, queue: vk::Queue, img_idx: usize) {
+        let f = self.img_fences[img_idx];
+        device.reset_fences(&[f]).expect("reset img fence");
+        let empty = vk::SubmitInfo::default();
+        device
+            .queue_submit(queue, &[empty], f)
+            .expect("submit img fence");
     }
 
     pub fn command_buffer(&self, img_idx: usize) -> &vk::CommandBuffer {
@@ -533,7 +550,6 @@ impl Renderer {
     }
 
     /// Same, with an optional sprite batch drawn first (under the text).
-    /// Frame time flows through the batcher's UBO, not through commands.
     pub unsafe fn record_frame(
         &mut self,
         device: &ash::Device,
@@ -545,6 +561,11 @@ impl Renderer {
             return Err(anyhow!("record: img_idx out of range"));
         }
         self.cb_dirty[img_idx] = false;
+        // the image's previous CB may still be executing (IMMEDIATE present
+        // does not throttle acquire): wait for its fence before reset/record
+        device
+            .wait_for_fences(&[self.img_fences[img_idx]], true, 2_000_000_000)
+            .map_err(|e| anyhow!("img cb fence wait: {e:?}"))?;
         let cmd = self.cmds[img_idx];
         device
             .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
@@ -552,6 +573,37 @@ impl Renderer {
         device
             .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
             .expect("begin cmd");
+
+        // image layout transitions: the swapchain image arrives in an
+        // arbitrary (usually UNDEFINED) layout — transition to
+        // COLOR_ATTACHMENT_OPTIMAL before rendering and to PRESENT_SRC_KHR
+        // after rendering (VK_LAYER_KHRONOS_validation requirement)
+        let img = self.images[img_idx];
+        let subres = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let to_color = vk::ImageMemoryBarrier {
+            src_access_mask: vk::AccessFlags::empty(),
+            dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            old_layout: vk::ImageLayout::UNDEFINED,
+            new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            image: img,
+            subresource_range: subres,
+            ..Default::default()
+        };
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::DependencyFlags::empty(),
+            &[], &[], &[to_color],
+        );
 
         // dynamic rendering: begin/end rendering instead of a render pass
         let clear_vals = [vk::ClearValue {
@@ -592,6 +644,32 @@ impl Renderer {
             device.cmd_draw(cmd, self.verts.len() as u32, 1, 0, 0);
         }
         device.cmd_end_rendering(cmd);
+        // transition to the present layout (images must be in
+        // VK_IMAGE_LAYOUT_PRESENT_SRC_KHR at vkQueuePresentKHR) — skipped
+        // when the screenshot path below does its own final transition
+        let shot_now = self.shot_pending
+            && self.shot_buf != vk::Buffer::null()
+            && (img_idx as u32) < self.images.len() as u32;
+        if !shot_now {
+        let to_present = vk::ImageMemoryBarrier {
+            src_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            dst_access_mask: vk::AccessFlags::empty(),
+            old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            new_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            image: img,
+            subresource_range: subres,
+            ..Default::default()
+        };
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[], &[], &[to_present],
+        );
+        }
         // screenshot: copy the swapchain image out before present
         if self.shot_pending
             && self.shot_buf != vk::Buffer::null()

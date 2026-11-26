@@ -424,12 +424,18 @@ impl InputCore {
     pub fn events_last_poll(&self) -> u32 {
         self.events_last_poll
     }
+
+    /// Release SDL handles before SDL_Quit. Idempotent: Drop calls it too,
+    /// so a late drop after SDL_Quit is a no-op.
+    pub fn close(&mut self) {
+        if let Some(pad) = self.gamepad.take() {
+            unsafe { SDL_CloseGamepad(pad.handle) };
+        }
+    }
 }
 
 impl Drop for InputCore {
     fn drop(&mut self) {
-        if let Some(pad) = &self.gamepad {
-            unsafe { SDL_CloseGamepad(pad.handle) };
-        }
+        self.close();
     }
 }

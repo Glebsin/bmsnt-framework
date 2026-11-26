@@ -1,6 +1,6 @@
-//! vk5k engine library: raw Vulkan 1.4 renderer, SDL3 platform, input core.
+//! bmsnt-framework engine library: raw Vulkan 1.4 renderer, SDL3 platform, input core.
 //!
-//! Binaries (vk5k, testapp) are thin shells on top of this crate.
+//! Binaries (bmsnt-framework, bmsnt_test_browser) are thin shells on top of this crate.
 
 pub mod core;
 pub mod gfx;

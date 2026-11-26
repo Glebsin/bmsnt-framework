@@ -52,13 +52,9 @@ struct Section {
 pub struct SpriteBatcher {
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
-    /// two set layouts, matching what the naga SPIR-V backend emits for the
-    /// WGSL (texture+sampler pairs are renumbered into sequential sets, each
-    /// with binding 0): set0 = sampled image, set1 = sampler
-    desc_layouts: [vk::DescriptorSetLayout; 2],
+    desc_layout: vk::DescriptorSetLayout,
     desc_pool: vk::DescriptorPool,
-    /// static descriptor pair (no per-slot data in this pipeline)
-    desc_sets: [vk::DescriptorSet; 2],
+    desc_set: vk::DescriptorSet,
     atlas_img: vk::Image,
     atlas_mem: vk::DeviceMemory,
     atlas_view: vk::ImageView,
@@ -293,10 +289,12 @@ impl SpriteBatcher {
                 None,
             )
             .map_err(|e| anyhow!("sampler: {e:?}"))?;
-        // --- descriptor layouts: one per resource, binding 0 in each set.
-        // A single combined-image-sampler layout here does NOT match the
-        // SPIR-V the backend generates: the shader's sampler stays unbound
-        // and every textured sprite renders invisible.
+        // --- descriptor layout, pool, set ---
+        // ONE set with two bindings, exactly as the WGSL declares them
+        // (texture @0, sampler @1 in group 0): VK_LAYER_KHRONOS_validation
+        // confirms this matches the compiled SPIR-V; a COMBINED_IMAGE_SAMPLER
+        // here leaves the shader's sampler unbound and every textured sprite
+        // invisible.
         let b_image = vk::DescriptorSetLayoutBinding {
             binding: 0,
             descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
@@ -305,37 +303,27 @@ impl SpriteBatcher {
             ..Default::default()
         };
         let b_sampler = vk::DescriptorSetLayoutBinding {
-            binding: 0,
+            binding: 1,
             descriptor_type: vk::DescriptorType::SAMPLER,
             descriptor_count: 1,
             stage_flags: vk::ShaderStageFlags::FRAGMENT,
             ..Default::default()
         };
-        let layout_image = device
+        let bindings = [b_image, b_sampler];
+        let desc_layout = device
             .create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo {
-                    binding_count: 1,
-                    p_bindings: &b_image,
+                    binding_count: bindings.len() as u32,
+                    p_bindings: bindings.as_ptr(),
                     ..Default::default()
                 },
                 None,
             )
-            .map_err(|e| anyhow!("desc layout 0: {e:?}"))?;
-        let layout_sampler = device
-            .create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo {
-                    binding_count: 1,
-                    p_bindings: &b_sampler,
-                    ..Default::default()
-                },
-                None,
-            )
-            .map_err(|e| anyhow!("desc layout 1: {e:?}"))?;
-        let desc_layouts = [layout_image, layout_sampler];
+            .map_err(|e| anyhow!("desc layout: {e:?}"))?;
         let desc_pool = device
             .create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo {
-                    max_sets: 2,
+                    max_sets: 1,
                     pool_size_count: 2,
                     p_pool_sizes: [
                         vk::DescriptorPoolSize {
@@ -353,16 +341,14 @@ impl SpriteBatcher {
                 None,
             )
             .map_err(|e| anyhow!("desc pool: {e:?}"))?;
-        let triple = [desc_layouts[0], desc_layouts[1]];
-        let raw = device
+        let desc_set = device
             .allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo {
                 descriptor_pool: desc_pool,
-                descriptor_set_count: 2,
-                p_set_layouts: triple.as_ptr(),
+                descriptor_set_count: 1,
+                p_set_layouts: [desc_layout].as_ptr(),
                 ..Default::default()
             })
-            .map_err(|e| anyhow!("desc sets: {e:?}"))?;
-        let desc_sets = [raw[0], raw[1]];
+            .map_err(|e| anyhow!("desc set: {e:?}"))?[0];
         let tex_infos = [vk::DescriptorImageInfo {
             image_view: atlas_view,
             image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -375,7 +361,7 @@ impl SpriteBatcher {
         device.update_descriptor_sets(
             &[
                 vk::WriteDescriptorSet {
-                    dst_set: desc_sets[0],
+                    dst_set: desc_set,
                     dst_binding: 0,
                     descriptor_count: 1,
                     descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
@@ -383,8 +369,8 @@ impl SpriteBatcher {
                     ..Default::default()
                 },
                 vk::WriteDescriptorSet {
-                    dst_set: desc_sets[1],
-                    dst_binding: 0,
+                    dst_set: desc_set,
+                    dst_binding: 1,
                     descriptor_count: 1,
                     descriptor_type: vk::DescriptorType::SAMPLER,
                     p_image_info: sampler_infos.as_ptr(),
@@ -398,8 +384,8 @@ impl SpriteBatcher {
         let layout = device
             .create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo {
-                    set_layout_count: desc_layouts.len() as u32,
-                    p_set_layouts: desc_layouts.as_ptr(),
+                    set_layout_count: 1,
+                    p_set_layouts: [desc_layout].as_ptr(),
                     ..Default::default()
                 },
                 None,
@@ -588,9 +574,9 @@ impl SpriteBatcher {
         Ok(Self {
             pipeline,
             layout,
-            desc_layouts,
+            desc_layout,
             desc_pool,
-            desc_sets,
+            desc_set,
             atlas_img,
             atlas_mem,
             atlas_view,
@@ -746,7 +732,7 @@ impl SpriteBatcher {
             vk::PipelineBindPoint::GRAPHICS,
             self.layout,
             0,
-            &self.desc_sets,
+            &[self.desc_set],
             &[],
         );
         for s in &self.sections {
@@ -773,9 +759,7 @@ impl SpriteBatcher {
         device.free_memory(self.inst_mem, None);
         device.destroy_buffer(self.inst_buf, None);
         device.destroy_descriptor_pool(self.desc_pool, None);
-        for l in &self.desc_layouts {
-            device.destroy_descriptor_set_layout(*l, None);
-        }
+        device.destroy_descriptor_set_layout(self.desc_layout, None);
         device.destroy_sampler(self.sampler, None);
         device.destroy_image_view(self.atlas_view, None);
         device.destroy_image(self.atlas_img, None);

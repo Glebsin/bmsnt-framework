@@ -10,21 +10,21 @@ use std::time::Instant;
 
 use ash::vk;
 
-use vk5k::core::time::{FrameStats, WARMUP_MS};
-use vk5k::gfx::device::GfxContext;
-use vk5k::gfx::frames::FramesInFlight;
-use vk5k::gfx::frames::FRAMES_IN_FLIGHT;
-use vk5k::gfx::renderer::Renderer;
-use vk5k::gfx::sprite::SpriteBatcher;
-use vk5k::gfx::swapchain::{Acquire, Swapchain};
-use vk5k::input::{Binding, InputCore};
-use vk5k::platform::window::Window;
-use vk5k::ui::text::MAX_VERTS;
+use bmsnt_framework::core::time::{FrameStats, WARMUP_MS};
+use bmsnt_framework::gfx::device::GfxContext;
+use bmsnt_framework::gfx::frames::FramesInFlight;
+use bmsnt_framework::gfx::renderer::Renderer;
+use bmsnt_framework::gfx::sprite::SpriteBatcher;
+use bmsnt_framework::gfx::swapchain::{Acquire, Swapchain};
+use bmsnt_framework::input::{Binding, InputCore};
+use bmsnt_framework::platform::window::Window;
+use bmsnt_framework::ui::text::MAX_VERTS;
 
 use crate::screens::{SpriteBatchScreen, TestCase};
 use crate::theme::{DESIGN_H, DESIGN_W};
 use crate::ui::{self, Layout, UiState};
 
+const FRAMES_IN_FLIGHT: usize = 8;
 const STATS_WINDOW_MS: u64 = 250;
 
 /// fixed-dt update stage (120 Hz)
@@ -50,18 +50,19 @@ type UiSig = (
 pub unsafe fn run() -> Result<()> {
     // lock the GPU clock to the driver max, same as vk5d (needs admin;
     // failure is logged and non-fatal; reset on exit via Drop)
-    let nvml = match vk5k::core::nvml::Nvml::init_and_lock_max() {
+    let nvml = match bmsnt_framework::core::nvml::Nvml::init_and_lock_max() {
         Ok(n) => {
-            vk5k::elog!("GPU: {} | clock locked at {} MHz", n.gpu_name, n.locked_mhz);
+            bmsnt_framework::elog!("GPU: {} | clock locked at {} MHz", n.gpu_name, n.locked_mhz);
             Some(n)
         }
         Err(e) => {
-            vk5k::elog!("NVML clock lock unavailable: {e}");
+            bmsnt_framework::elog!("NVML clock lock unavailable: {e}");
             None
         }
     };
     let result = Game::new()?.run();
     drop(nvml); // reset clocks on exit
+    bmsnt_framework::elog!("exit: run complete");
     result
 }
 
@@ -72,27 +73,23 @@ struct Game {
     sprites: SpriteBatcher,
     frames: FramesInFlight,
     input: InputCore,
-    act_quit: vk5k::input::ActionId,
-    act_shot: vk5k::input::ActionId,
+    act_quit: bmsnt_framework::input::ActionId,
+    act_shot: bmsnt_framework::input::ActionId,
     ui: UiState,
     screens: Vec<Box<dyn TestCase>>,
     stats: FrameStats,
-    /// instance ring slots still waiting for their (deferred) upload: a slot
-    /// must never be written while the GPU is reading it, so uploads land
-    /// only in idle slots (early in the frame, before any submit)
-    pending_upload: [bool; FRAMES_IN_FLIGHT],
     /// seconds since app start; drives the test scenes
     t_start: Instant,
     /// previous frame signature for idle-change detection
     last_sig: Option<UiSig>,
-    /// TESTAPP_NOSPRITES read once at init (not per frame)
+    /// BMSNT_NOSPRITES read once at init (not per frame)
     no_sprites: bool,
     /// static display names of the tests (no per-frame allocation)
     screen_names: Vec<&'static str>,
     /// cached UI layer: instances after ui::draw and text verts (reused while
     /// a scene runs — the UI does not change frame to frame)
     ui_snap: Vec<f32>,
-    ui_verts: Vec<vk5k::ui::text::Vertex>,
+    ui_verts: Vec<bmsnt_framework::ui::text::Vertex>,
     /// last field: must be dropped AFTER ctx (the surface holds the hwnd)
     window: Window,
 }
@@ -100,7 +97,7 @@ struct Game {
 impl Game {
     /// Boot: window -> gfx context -> swapchain/renderer/sprites -> input/UI.
     unsafe fn new() -> Result<Self> {
-        let window = Window::new("vk-testapp", 1920, 1080)?;
+        let window = Window::new("bmsnt-test-browser", 1920, 1080)?;
         let ctx = GfxContext::new(window.hwnd())?;
         let swapchain = Swapchain::new(&ctx)?;
         let mut renderer = Renderer::new(&ctx)?;
@@ -124,8 +121,8 @@ impl Game {
         let screens: Vec<Box<dyn TestCase>> = vec![Box::new(SpriteBatchScreen::new())];
         let screen_names: Vec<&'static str> = screens.iter().map(|t| t.name()).collect();
 
-        vk5k::elog!(
-            "testapp swapchain: {}x{} images={} present_mode={:?}",
+        bmsnt_framework::elog!(
+            "bmsnt_test_browser swapchain: {}x{} images={} present_mode={:?}",
             swapchain.extent.width,
             swapchain.extent.height,
             swapchain.image_count(),
@@ -145,10 +142,9 @@ impl Game {
             ui: UiState::from_env(),
             screens,
             stats: FrameStats::new(sdl3_sys::everything::SDL_GetTicks()),
-            pending_upload: [true; FRAMES_IN_FLIGHT],
             t_start: Instant::now(),
             last_sig: None,
-            no_sprites: std::env::var("TESTAPP_NOSPRITES").is_ok(),
+            no_sprites: std::env::var("BMSNT_NOSPRITES").is_ok(),
             screen_names,
             ui_snap: Vec::new(),
             ui_verts: Vec::new(),
@@ -206,24 +202,9 @@ impl Game {
             }
             self.stats.t_wait += t0.elapsed().as_nanos();
             if !fence_ok {
-                vk5k::elog!("frame fence did not signal in 1 s — full rebuild");
+                bmsnt_framework::elog!("frame fence did not signal in 1 s — full rebuild");
                 self.full_rebuild()?;
                 continue 'main;
-            }
-
-            // EARLY in the frame: drain deferred uploads into every slot that
-            // became idle since the last frame — BEFORE acquire/record/submit,
-            // so a submitted CB can never read a slot with stale data (text
-            // flicker). Covers both the text vertices and the instances.
-            {
-                let mut idle = [false; FRAMES_IN_FLIGHT];
-                for i in 0..FRAMES_IN_FLIGHT {
-                    idle[i] = self.frames.is_idle(i);
-                }
-                unsafe {
-                    self.renderer.upload_text_pending(&idle);
-                    self.upload_instances_pending(&idle);
-                }
             }
 
             // --- acquire ---
@@ -298,23 +279,9 @@ impl Game {
                 self.ui_snap.extend_from_slice(self.sprites.instances());
 
                 let t0 = Instant::now();
-                unsafe {
-                    self.renderer.upload_verts(&self.ui_verts);
-                }
+                self.renderer.upload_verts(&self.ui_verts);
                 // static UI: identical data in every ring slot, so old CBs
-                // stay valid between updates — but only idle slots may be
-                // written now (in-flight slots are retried early next frame)
-                self.pending_upload = [true; FRAMES_IN_FLIGHT];
-                {
-                    let mut idle = [false; FRAMES_IN_FLIGHT];
-                    for i in 0..FRAMES_IN_FLIGHT {
-                        idle[i] = self.frames.is_idle(i);
-                    }
-                    unsafe {
-                        self.renderer.upload_text_pending(&idle);
-                        self.upload_instances_pending(&idle);
-                    }
-                }
+                // stay valid between updates
                 for s_i in 0..FRAMES_IN_FLIGHT {
                     self.sprites.upload_slot(self.ctx.device(), s_i);
                 }
@@ -341,9 +308,7 @@ impl Game {
                 // per-frame scene data: current slot only, every image's CB
                 // is re-recorded with it
                 let t0 = Instant::now();
-                unsafe { self.sprites.upload_slot(self.ctx.device(), slot) };
-                // the current slot now holds the full up-to-date frame
-                self.pending_upload[slot] = false;
+                self.sprites.upload_slot(self.ctx.device(), slot);
                 for i in 0..self.swapchain.image_count() {
                     self.renderer.mark_dirty(i);
                 }
@@ -374,7 +339,7 @@ impl Game {
                 let path = screenshot_path()?;
                 let path_str = path.to_string_lossy().into_owned();
                 self.renderer.write_png(&path_str)?;
-                vk5k::elog!("screenshot saved: {}", path.display());
+                bmsnt_framework::elog!("screenshot saved: {}", path.display());
             }
 
             self.frames.advance();
@@ -396,8 +361,8 @@ impl Game {
                 }
             }
 
-            // diagnostics: auto-screenshot at N seconds (TESTAPP_SHOT_SECS)
-            if let Ok(secs) = std::env::var("TESTAPP_SHOT_SECS") {
+            // diagnostics: auto-screenshot at N seconds (BMSNT_SHOT_SECS)
+            if let Ok(secs) = std::env::var("BMSNT_SHOT_SECS") {
                 if let Ok(ms) = secs.parse::<u64>() {
                     if !shot_done && now - start_ticks >= ms * 1000 {
                         self.renderer.request_screenshot();
@@ -415,27 +380,26 @@ impl Game {
 
         // --- teardown ---
         // tolerant: the device may have been lost during the session
+        bmsnt_framework::elog!("teardown: idle");
         let _ = self.ctx.device().device_wait_idle();
+        bmsnt_framework::elog!("teardown: on_idle");
         self.frames.on_idle();
+        bmsnt_framework::elog!("teardown: renderer");
         self.renderer.destroy(self.ctx.device());
+        bmsnt_framework::elog!("teardown: sprites");
         self.sprites.destroy(self.ctx.device());
+        bmsnt_framework::elog!("teardown: frames");
         self.frames.destroy(self.ctx.device());
+        bmsnt_framework::elog!("teardown: swapchain");
         self.swapchain.destroy(self.ctx.device());
+        bmsnt_framework::elog!("teardown: input");
+        self.input.close();
+        bmsnt_framework::elog!("teardown: ctx");
         self.ctx.destroy();
+        bmsnt_framework::elog!("teardown: window");
         self.window.destroy();
+        bmsnt_framework::elog!("teardown: done");
         Ok(())
-    }
-
-    /// Write pending instance data into every ring slot that is NOT in
-    /// flight. In-flight slots are skipped and retried early next frame —
-    /// writing them while the GPU fetches their instances tears the data.
-    unsafe fn upload_instances_pending(&mut self, idle: &[bool; FRAMES_IN_FLIGHT]) {
-        for s_i in 0..FRAMES_IN_FLIGHT {
-            if self.pending_upload[s_i] && idle[s_i] {
-                self.sprites.upload_slot(self.ctx.device(), s_i);
-                self.pending_upload[s_i] = false;
-            }
-        }
     }
 
     /// Drain the event queue once per frame. Returns false when the app
@@ -467,7 +431,7 @@ impl Game {
                 Acquire::NotReady => {
                     self.stats.acq_retries += 1;
                     if Instant::now() > deadline {
-                        vk5k::elog!(
+                        bmsnt_framework::elog!(
                             "acquire: no image for 100 ms ({} retries) — recreating",
                             self.stats.acq_retries
                         );
@@ -482,7 +446,7 @@ impl Game {
                 }
                 Acquire::DeviceLost => {
                     self.stats.t_acq += t0.elapsed().as_nanos();
-                    vk5k::elog!("acquire: device lost (fullscreen switch) — recreating");
+                    bmsnt_framework::elog!("acquire: device lost (fullscreen switch) — recreating");
                     *need_recreate = true;
                     break;
                 }
@@ -557,13 +521,17 @@ impl Game {
             // switches. Try the cheap path (swapchain recreation) first;
             // if vkDeviceWaitIdle also reports lost, recreate() escalates to
             // a full device-level rebuild.
-            vk5k::elog!("submit: device lost (fullscreen switch) — recreating");
+            bmsnt_framework::elog!("submit: device lost (fullscreen switch) — recreating");
+            bmsnt_framework::elog!("submit: on_idle");
             self.frames.on_idle(); // mark fences "logically signaled" before rebuild
             *need_recreate = true;
             return Ok(());
         }
         result.context("queue submit")?;
         self.stats.t_submit += t0.elapsed().as_nanos();
+        // fence for this image's CB: signals after this submit fully completes
+        self.renderer
+            .signal_image_fence(self.ctx.device(), self.ctx.queue, img_idx_u);
 
         // --- present ---
         let t0 = Instant::now();
@@ -573,7 +541,7 @@ impl Game {
         if let Err(vk::Result::ERROR_OUT_OF_DATE_KHR) = present_result {
             *need_recreate = true;
         } else if let Err(vk::Result::ERROR_DEVICE_LOST) = present_result {
-            vk5k::elog!("present: device lost (fullscreen switch) — recreating");
+            bmsnt_framework::elog!("present: device lost (fullscreen switch) — recreating");
             *need_recreate = true;
         } else if let Err(e) = present_result {
             return Err(anyhow!("present: {e:?}"));
@@ -594,13 +562,16 @@ impl Game {
             return self.full_rebuild();
         }
         // after a fullscreen switch the device may report lost — do not fail here
+        bmsnt_framework::elog!("rebuild: idle");
         let _ = self.ctx.device().device_wait_idle();
+        bmsnt_framework::elog!("rebuild: on_idle");
         self.frames.on_idle();
         self.renderer.destroy_swapchain_objects(self.ctx.device());
+        bmsnt_framework::elog!("rebuild: swapchain");
         self.swapchain.destroy(self.ctx.device());
         self.swapchain = Swapchain::new(&self.ctx)?;
         self.renderer.create_swapchain_objects(&self.ctx, &self.swapchain)?;
-        vk5k::elog!(
+        bmsnt_framework::elog!(
             "swapchain recreated: {}x{}",
             self.swapchain.extent.width,
             self.swapchain.extent.height
@@ -613,17 +584,21 @@ impl Game {
     /// Retries briefly — the lost state during a fullscreen switch can take
     /// a moment to clear.
     unsafe fn full_rebuild(&mut self) -> Result<()> {
-        vk5k::elog!("device lost — full rebuild");
+        bmsnt_framework::elog!("device lost — full rebuild");
         // best-effort destruction on a lost device
+        bmsnt_framework::elog!("rebuild: renderer");
         self.renderer.destroy(self.ctx.device());
+        bmsnt_framework::elog!("rebuild: sprites");
         self.sprites.destroy(self.ctx.device());
+        bmsnt_framework::elog!("rebuild: frames");
         self.frames.destroy(self.ctx.device());
+        bmsnt_framework::elog!("rebuild: swapchain");
         self.swapchain.destroy(self.ctx.device());
         for attempt in 1..=10u32 {
             match self.rebuild_device_stack() {
                 Ok(()) => return Ok(()),
                 Err(e) if attempt < 10 => {
-                    vk5k::elog!("rebuild attempt {attempt} failed: {e:#}; retrying");
+                    bmsnt_framework::elog!("rebuild attempt {attempt} failed: {e:#}; retrying");
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 Err(e) => return Err(e),
@@ -635,7 +610,6 @@ impl Game {
     unsafe fn rebuild_device_stack(&mut self) -> Result<()> {
         self.ctx.recreate_device()?;
         self.frames = FramesInFlight::new(self.ctx.device(), FRAMES_IN_FLIGHT);
-        self.pending_upload = [true; FRAMES_IN_FLIGHT];
         self.sprites = SpriteBatcher::new(&self.ctx)?;
         self.swapchain = Swapchain::new(&self.ctx)?;
         self.renderer = Renderer::new(&self.ctx)?;
@@ -644,7 +618,7 @@ impl Game {
     }
 }
 
-/// Screenshots go to `<exe dir>/Screenshots/testapp_<n>.png`; `n` is the
+/// Screenshots go to `<exe dir>/Screenshots/bmsnt_test_browser_<n>.png`; `n` is the
 /// first free number so files never overwrite each other.
 fn screenshot_path() -> Result<std::path::PathBuf> {
     let exe = std::env::current_exe().context("current_exe")?;
@@ -655,7 +629,7 @@ fn screenshot_path() -> Result<std::path::PathBuf> {
     std::fs::create_dir_all(&dir).context("create Screenshots dir")?;
     let mut n = 1u32;
     loop {
-        let p = dir.join(format!("testapp_{n:04}.png"));
+        let p = dir.join(format!("bmsnt_test_browser_{n:04}.png"));
         if !p.exists() {
             return Ok(p);
         }

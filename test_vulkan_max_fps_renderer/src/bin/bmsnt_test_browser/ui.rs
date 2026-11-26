@@ -2,8 +2,8 @@
 //! `draw` of all panels, buttons and text — the osu-framework drawable layer
 //! rendered by the sprite batcher. Layout lives in design space (`theme`).
 
-use vk5k::gfx::sprite::SpriteBatcher;
-use vk5k::ui::text::{build_text, Vertex};
+use bmsnt_framework::gfx::sprite::SpriteBatcher;
+use bmsnt_framework::ui::text::{build_text, Vertex};
 
 use crate::theme::*;
 
@@ -32,15 +32,15 @@ pub struct UiState {
 }
 
 impl UiState {
-    /// `TESTAPP_TEST=<i>` preselects test `i` and auto-starts it (for
+    /// `BMSNT_TEST=<i>` preselects test `i` and auto-starts it (for
     /// automated runs).
     pub fn from_env() -> Self {
         Self {
             expanded: true,
-            selected_test: std::env::var("TESTAPP_TEST")
+            selected_test: std::env::var("BMSNT_TEST")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok()),
-            running: std::env::var("TESTAPP_TEST").is_ok(),
+            running: std::env::var("BMSNT_TEST").is_ok(),
         }
     }
 }

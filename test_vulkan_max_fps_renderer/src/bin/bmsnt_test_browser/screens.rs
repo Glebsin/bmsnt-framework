@@ -2,7 +2,7 @@
 //! scissored game view. Adding a test = implementing `TestCase` and
 //! registering it in `Game`.
 
-use vk5k::gfx::sprite::SpriteBatcher;
+use bmsnt_framework::gfx::sprite::SpriteBatcher;
 
 use crate::ui::Rect;
 
