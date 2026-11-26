@@ -569,6 +569,31 @@ impl SpriteBatcher {
         self.cur_section = None;
     }
 
+    /// Snapshot of all instances pushed so far (cache a static UI layer).
+    pub fn instances(&self) -> &[f32] {
+        &self.instances
+    }
+
+    /// Push pre-built instances that all share one scissor rect; restores
+    /// them as a single section (used to re-apply a cached UI layer without
+    /// rebuilding its geometry).
+    pub fn push_cached(&mut self, data: &[f32], sc: [f32; 4]) {
+        debug_assert!(
+            data.len() % INSTANCE_F32 == 0,
+            "cached instance data not a multiple of the instance stride"
+        );
+        if data.is_empty() {
+            return;
+        }
+        let first = (self.instances.len() / INSTANCE_F32) as u32;
+        self.instances.extend_from_slice(data);
+        self.sections.push(Section {
+            first_instance: first,
+            count: (data.len() / INSTANCE_F32) as u32,
+            sc,
+        });
+    }
+
     /// Set the scissor rect (framebuffer pixels) for subsequent sprites.
     /// Pushing with a new rect starts a new section (one extra draw call).
     pub fn begin_section(&mut self, x: f32, y: f32, w: f32, h: f32) {

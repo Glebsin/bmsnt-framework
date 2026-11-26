@@ -241,6 +241,20 @@ impl GfxContext {
         &self.swapchain_loader
     }
 
+    /// Recreate the VkDevice (after an unrecoverable device lost, e.g. an
+    /// NVIDIA fullscreen-switch transition). Instance/surface are kept.
+    /// All device-level objects (swapchain, renderer resources, fences) must
+    /// be destroyed before and rebuilt after this call.
+    pub unsafe fn recreate_device(&mut self) -> Result<()> {
+        self.device.destroy_device(None);
+        let device = Self::create_device_for(&self.instance, self.pdevice, self.queue_family)?;
+        self.queue = device.get_device_queue(self.queue_family, 0);
+        self.swapchain_loader = ash::khr::swapchain::Device::load(&self.instance, &device);
+        self.device = device;
+        crate::elog!("device recreated");
+        Ok(())
+    }
+
     /// Full teardown: device -> surface -> instance. Call after everything
     /// else (renderer/swapchain/frames) is destroyed and idle.
     pub unsafe fn destroy(self) {
@@ -251,5 +265,37 @@ impl GfxContext {
             ptr::null(),
         );
         self.instance.destroy_instance(None);
+    }
+
+    /// Device creation shared by `new` and `recreate_device`.
+    unsafe fn create_device_for(
+        instance: &Instance,
+        pdevice: vk::PhysicalDevice,
+        qfi: u32,
+    ) -> Result<ash::Device> {        let queue_priorities = [1.0f32];
+        let queue_info = vk::DeviceQueueCreateInfo {
+            queue_family_index: qfi,
+            queue_count: 1,
+            p_queue_priorities: queue_priorities.as_ptr(),
+            ..Default::default()
+        };
+        let dev_exts = [c"VK_KHR_swapchain".as_ptr()];
+        // dynamicRendering is core in 1.3 but must be enabled EXPLICITLY via
+        // Vulkan13Features (validation checks it, the driver may not)
+        let mut vulkan13_features = vk::PhysicalDeviceVulkan13Features {
+            dynamic_rendering: vk::TRUE,
+            ..Default::default()
+        };
+        let dev_info = vk::DeviceCreateInfo {
+            queue_create_info_count: 1,
+            p_queue_create_infos: &queue_info,
+            enabled_extension_count: dev_exts.len() as u32,
+            pp_enabled_extension_names: dev_exts.as_ptr(),
+            p_next: &mut vulkan13_features as *mut _ as *const c_void,
+            ..Default::default()
+        };
+        instance
+            .create_device(pdevice, &dev_info, None)
+            .map_err(|e| anyhow!("create_device: {e:?}"))
     }
 }

@@ -71,6 +71,28 @@ impl FramesInFlight {
         &self.img_sems[slot]
     }
 
+    /// Wait for the slot fence if still in flight, bounded by `timeout_ns`.
+    /// Returns Ok(true) when the slot is idle, Ok(false) on timeout (the
+    /// device may be wedged — the caller decides to rebuild or retry).
+    pub unsafe fn try_ensure_idle(
+        &mut self,
+        device: &ash::Device,
+        slot: usize,
+        timeout_ns: u64,
+    ) -> Result<bool> {
+        if self.signaled[slot] {
+            return Ok(true);
+        }
+        match device.wait_for_fences(&[self.fences[slot]], true, timeout_ns) {
+            Ok(()) => {
+                self.signaled[slot] = true;
+                Ok(true)
+            }
+            Err(vk::Result::TIMEOUT) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Wait for the slot fence if still in flight. The fence itself is NOT
     /// reset here — reset happens right before submit (`reset_for_submit`).
     pub unsafe fn ensure_idle(&mut self, device: &ash::Device, slot: usize) -> Result<()> {

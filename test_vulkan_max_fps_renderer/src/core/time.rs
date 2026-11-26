@@ -14,10 +14,19 @@ pub struct FrameStats {
     pub t_submit: u128,
     pub t_present: u128,
     pub t_events: u128,
+    /// ui::draw (text + panels geometry)
+    pub t_ui: u128,
+    /// test scene draw (SpriteBatch stress etc.)
+    pub t_scene: u128,
     pub acq_calls: u32,
     pub acq_retries: u32,
     /// present went through DWM composition instead of exclusive flip
     pub flip_lost: bool,
+    /// hysteresis: consecutive windows below / above the flip threshold —
+    /// present time fluctuates around 80 us under load, so the state may
+    /// only change after several consistent windows
+    flip_below_streak: u32,
+    flip_above_streak: u32,
     frame_us: Vec<u32>,
     t_frame: Option<Instant>,
     pub window_start: u64,
@@ -69,22 +78,46 @@ impl FrameStats {
 
         // presentation-path detector: on exclusive flip present costs
         // ~110-130 us CPU; consistently < 80 us means frames go through DWM
-        // composition (flip lost: overlay/occlusion/HDR/driver settings),
-        // which caps fps at ~3k everything else being equal.
+        // composition (flip lost: overlay/occlusion/HDR/driver settings).
+        // Composition ALSO caps fps at ~3k on this machine — a low present
+        // time with high fps means the flip path simply got faster (e.g.
+        // NVML clock lock), not that flip was lost. So LOST requires BOTH:
+        // low present time AND the composition fps ceiling. Hysteresis: 3
+        // consecutive windows are required to change the state.
         let present_us = self.t_present as f64 / n / 1000.0;
-        let flip_note = if self.t_present > 0 && present_us < 80.0 && fps > 1000 {
-            self.flip_lost = true;
+        const FLIP_LOST_AFTER: u32 = 3;
+        const FLIP_OK_AFTER: u32 = 3;
+        const COMPOSITION_FPS_CEILING: i64 = 4500;
+        if self.t_present > 0
+            && present_us < 80.0
+            && fps > 1000
+            && fps < COMPOSITION_FPS_CEILING
+        {
+            self.flip_below_streak += 1;
+            self.flip_above_streak = 0;
+            if self.flip_below_streak >= FLIP_LOST_AFTER {
+                self.flip_lost = true;
+            }
+        } else if self.t_present > 0 {
+            self.flip_above_streak += 1;
+            self.flip_below_streak = 0;
+            if self.flip_above_streak >= FLIP_OK_AFTER {
+                self.flip_lost = false;
+            }
+        }
+        let flip_note = if self.flip_lost {
             "  << !! FLIP LOST: present via DWM composition >>"
         } else {
-            self.flip_lost = false;
             ""
         };
 
         crate::elog!(
-            "fps: {fps} | cpu avg us/frame: wait {:.1} acq {:.1} rec {:.1} submit {:.1} present {:.1} events {:.1} | frame us avg {:.0} p95 {} max {} | 1% low {:.2} ms 0.1% low {:.2} ms | acq calls {} retries {}{flip_note}",
+            "fps: {fps} | cpu avg us/frame: wait {:.1} acq {:.1} rec {:.1} ui {:.1} scene {:.1} submit {:.1} present {:.1} events {:.1} | frame us avg {:.0} p95 {} max {} | 1% low {:.2} ms 0.1% low {:.2} ms | acq calls {} retries {}{flip_note}",
             self.t_wait as f64 / n / 1000.0,
             self.t_acq as f64 / n / 1000.0,
             self.t_rec as f64 / n / 1000.0,
+            self.t_ui as f64 / n / 1000.0,
+            self.t_scene as f64 / n / 1000.0,
             self.t_submit as f64 / n / 1000.0,
             self.t_present as f64 / n / 1000.0,
             self.t_events as f64 / n / 1000.0,
@@ -109,6 +142,8 @@ impl FrameStats {
         self.t_submit = 0;
         self.t_present = 0;
         self.t_events = 0;
+        self.t_ui = 0;
+        self.t_scene = 0;
         self.acq_calls = 0;
         self.acq_retries = 0;
         self.frame_us.clear();

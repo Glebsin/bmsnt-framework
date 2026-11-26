@@ -25,4 +25,47 @@ fn main() {
         fs::write(Path::new(&out_dir).join(out), &bytes).unwrap_or_else(|e| panic!("write {out}: {e}"));
         println!("cargo:rerun-if-changed={src}");
     }
+
+    // Windows manifest for the testapp binary only: requireAdministrator so
+    // NVML clock locking works on a normal double-click. Compiled with the
+    // SDK resource compiler (rc.exe) and linked into testapp.exe via a
+    // per-binary link arg (vk5k.exe stays without the elevation requirement).
+    // Fallback: without rc.exe the build continues without the manifest.
+    println!("cargo:rerun-if-changed=src/bin/testapp/testapp.manifest");
+    println!("cargo:rerun-if-changed=src/bin/testapp/testapp.rc");
+    let rc_script = "src/bin/testapp/testapp.rc";
+    if Path::new(rc_script).exists() {
+        if let Some(rc) = find_rc() {
+            let res = Path::new(&out_dir).join("testapp.res");
+            let status = std::process::Command::new(&rc)
+                .args(["/nologo", "/fo", res.to_str().unwrap(), rc_script])
+                .status();
+            match status {
+                Ok(s) if s.success() => {
+                    println!("cargo:rustc-link-arg-bin=testapp={}", res.to_str().unwrap());
+                }
+                _ => println!("cargo:warning=rc.exe failed; testapp built WITHOUT the admin manifest"),
+            }
+        } else {
+            println!("cargo:warning=rc.exe not found; testapp built WITHOUT the admin manifest");
+        }
+    }
+}
+
+/// Locate the Windows SDK resource compiler (newest kit first).
+fn find_rc() -> Option<std::path::PathBuf> {
+    if let Ok(rc) = env::var("RC") {
+        if Path::new(&rc).exists() {
+            return Some(rc.into());
+        }
+    }
+    let root = Path::new(r"C:\Program Files (x86)\Windows Kits\10\bin");
+    let mut kits: Vec<_> = fs::read_dir(root)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().join("x64\\rc.exe").exists())
+        .map(|e| e.path())
+        .collect();
+    kits.sort();
+    kits.pop().map(|p| p.join("x64\\rc.exe"))
 }

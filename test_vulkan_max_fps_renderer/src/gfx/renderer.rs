@@ -303,9 +303,25 @@ impl Renderer {
         };
 
         // --- screenshot buffer (host visible, BGRA, w*h*4) ---
-        let device = ctx.device();
+        // non-fatal: a transient allocation failure (e.g. after device-lost
+        // churn) only disables screenshots, the renderer keeps running
         self.images = sc.images.clone();
-        let byte_size = (sc.extent.width * sc.extent.height * 4) as u64;
+        match self.setup_shot(ctx, sc.extent) {
+            Ok(()) => {}
+            Err(e) => {
+                crate::elog!("screenshot buffer unavailable: {e:#}; screenshots disabled");
+                self.shot_pending = false;
+                self.shot_ready = false;
+            }
+        }
+        Ok(())
+    }
+
+    /// Allocate the host-visible screenshot buffer. On error the partial
+    /// resources are cleaned up.
+    unsafe fn setup_shot(&mut self, ctx: &GfxContext, extent: vk::Extent2D) -> Result<()> {
+        let device = ctx.device();
+        let byte_size = (extent.width as u64) * (extent.height as u64) * 4;
         let shot_buf = device
             .create_buffer(
                 &vk::BufferCreateInfo {
@@ -316,7 +332,7 @@ impl Renderer {
                 },
                 None,
             )
-            .expect("shot buf");
+            .map_err(|e| anyhow!("shot buf: {e:?}"))?;
         let req = device.get_buffer_memory_requirements(shot_buf);
         let mem_props = ctx.instance().get_physical_device_memory_properties(ctx.pdevice);
         let host_idx = (0..mem_props.memory_type_count)
@@ -328,24 +344,38 @@ impl Renderer {
                         .contains(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
             })
             .ok_or_else(|| anyhow!("host visible memory type"))? as u32;
-        let shot_mem = device
-            .allocate_memory(
-                &vk::MemoryAllocateInfo {
-                    allocation_size: req.size,
-                    memory_type_index: host_idx,
-                    ..Default::default()
-                },
-                None,
-            )
-            .expect("shot mem");
-        device.bind_buffer_memory(shot_buf, shot_mem, 0).expect("bind shot");
-        let shot_map = device
-            .map_memory(shot_mem, 0, byte_size, vk::MemoryMapFlags::empty())
-            .expect("map shot");
+        let shot_mem = match device.allocate_memory(
+            &vk::MemoryAllocateInfo {
+                allocation_size: req.size,
+                memory_type_index: host_idx,
+                ..Default::default()
+            },
+            None,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                // partial: destroy the buffer, keep the renderer alive
+                device.destroy_buffer(shot_buf, None);
+                return Err(anyhow!("shot mem: {e:?}"));
+            }
+        };
+        if let Err(e) = device.bind_buffer_memory(shot_buf, shot_mem, 0) {
+            device.destroy_buffer(shot_buf, None);
+            device.free_memory(shot_mem, None);
+            return Err(anyhow!("bind shot: {e:?}"));
+        }
+        let shot_map = match device.map_memory(shot_mem, 0, byte_size, vk::MemoryMapFlags::empty()) {
+            Ok(m) => m,
+            Err(e) => {
+                device.destroy_buffer(shot_buf, None);
+                device.free_memory(shot_mem, None);
+                return Err(anyhow!("map shot: {e:?}"));
+            }
+        };
         self.shot_buf = shot_buf;
         self.shot_mem = shot_mem;
         self.shot_map = shot_map;
-        self.shot_extent = sc.extent;
+        self.shot_extent = extent;
         Ok(())
     }
 
@@ -359,6 +389,12 @@ impl Renderer {
     /// True after the pending screenshot has been copied out.
     pub fn shot_ready(&self) -> bool {
         self.shot_ready
+    }
+
+    /// True while a screenshot copy is still pending (not yet recorded).
+    /// The caller must force CB re-record + upload this frame.
+    pub fn shot_pending(&self) -> bool {
+        self.shot_pending
     }
 
     /// Write the captured frame as a PNG next to the exe.
@@ -536,7 +572,10 @@ impl Renderer {
         }
         device.cmd_end_rendering(cmd);
         // screenshot: copy the swapchain image out before present
-        if self.shot_pending && (img_idx as u32) < self.images.len() as u32 {
+        if self.shot_pending
+            && self.shot_buf != vk::Buffer::null()
+            && (img_idx as u32) < self.images.len() as u32
+        {
             self.shot_pending = false;
             self.shot_ready = true;
             let img = self.images[img_idx];
