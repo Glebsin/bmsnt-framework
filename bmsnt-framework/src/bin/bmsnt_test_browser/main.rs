@@ -1,6 +1,6 @@
 //! TestApp: test browser for engine features (Phase 2 proving ground).
 //! Thin shell: the whole browser lives in the framework library
-//! (`bmsnt_framework::testing`, osu-framework `Testing/` analogue).
+//! (`bmsnt_framework::testing`).
 
 // no console: a visible console forces DWM composition instead of flip
 #![windows_subsystem = "windows"]

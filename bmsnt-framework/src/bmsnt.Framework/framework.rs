@@ -1,9 +1,9 @@
 //! bmsnt-framework engine library root.
 //!
-//! Layout mirrors osu-framework: `Graphics` (Vulkan backend, sprites,
+//! Layout (component style): `Graphics` (Vulkan backend, sprites,
 //! primitives), `Input`, `Logging`, `Platform` (SDL3 window, NVIDIA driver),
 //! `Statistics`, `Text`, `Testing` (the test browser lives inside the
-//! framework, like `osu.Framework/Testing`). The PascalCase folder name
+//! framework). The PascalCase folder name
 //! needs an explicit `#[path]` — Rust module identifiers cannot contain
 //! a dot.
 

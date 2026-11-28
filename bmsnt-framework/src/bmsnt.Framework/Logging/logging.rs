@@ -1,5 +1,5 @@
 //! Engine log: file sink behind a mutex, initialized once by the binary's
-//! main (osu-framework `Logging/` analogue).
+//! main.
 
 /// log file handle behind a mutex; initialized once by the binary's main
 pub static LOG_SINK: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);

@@ -1,6 +1,6 @@
 // Sprite batcher shader: instanced quads sampled from a texture atlas,
 // plus a special "gradient" mode with per-pixel dithering to kill banding
-// (same idea as ppy/osu-framework#6820 dithering).
+// (dithering hides banding on subtle gradients).
 //
 // Instance attributes (binding 0, instance rate, 80 bytes):
 //   loc0: pos.xy, size.xy              (pixels, top-left origin)

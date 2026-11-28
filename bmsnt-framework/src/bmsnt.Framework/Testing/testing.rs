@@ -1,4 +1,4 @@
-//! Test browser infrastructure (osu-framework `Testing/` analogue):
+//! Test browser infrastructure:
 //! the browser app flow, test scenes, browser UI and the design palette.
 //! The binary is a thin shell calling [`run`].
 

@@ -1,4 +1,4 @@
-//! Graphics primitives (osu-framework `Graphics/Primitives` analogue).
+//! Graphics primitives.
 
 /// Axis-aligned rect in design space; the primitive of every UI element.
 pub struct Rect {

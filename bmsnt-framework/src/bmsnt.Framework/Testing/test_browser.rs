@@ -1,4 +1,4 @@
-//! TestApp game host (osu-framework style): owns the window, the gfx stack
+//! TestApp game host: owns the window, the gfx stack
 //! and the frame loop (input -> update -> draw -> present). Tests live in
 //! `screens`, immediate-mode UI in `ui`, palette/layout in `theme`.
 //!

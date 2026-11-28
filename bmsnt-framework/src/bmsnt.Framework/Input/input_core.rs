@@ -1,4 +1,4 @@
-//! Input core (Phase 2.1) — osu!lazer style: action mapping, edge events,
+//! Input core (Phase 2.1): action mapping, edge events,
 //! per-event timestamps in SDL monotonic ns.
 //!
 //! Low-latency principles:

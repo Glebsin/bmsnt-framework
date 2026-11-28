@@ -1,5 +1,5 @@
 //! bmsnt-framework engine library: raw Vulkan 1.4 renderer, SDL3 platform,
-//! input core. All engine code lives in `bmsnt.Framework/` (osu-framework
+//! input core. All engine code lives in `bmsnt.Framework/` (
 //! style layout); binaries are thin shells on top of this crate.
 
 #[path = "bmsnt.Framework/framework.rs"]

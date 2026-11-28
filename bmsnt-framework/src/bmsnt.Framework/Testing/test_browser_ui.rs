@@ -1,5 +1,5 @@
 //! Immediate-mode UI: hit-test rects ("drawables"), app state and a one-shot
-//! `draw` of all panels, buttons and text — the osu-framework drawable layer
+//! `draw` of all panels, buttons and text — the drawable layer
 //! rendered by the sprite batcher. Layout lives in design space (`theme`).
 
 use crate::graphics::primitives::Rect;

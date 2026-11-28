@@ -1,7 +1,7 @@
 //! Theme: palette and design-space layout constants.
 //!
 //! The UI is designed at 1920x1080 and uniformly scaled to the real
-//! viewport (the osu-framework approach: everything is laid out in a fixed
+//! viewport (everything is laid out in a fixed
 //! design space, then scaled as one unit).
 
 /// layout is designed at 1920x1080 and scaled to the real viewport

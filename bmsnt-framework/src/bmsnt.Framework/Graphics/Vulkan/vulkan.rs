@@ -1,5 +1,5 @@
 //! Vulkan backend: device, swapchain, frames-in-flight sync and the
-//! renderer (osu-framework `Graphics/OpenGL` analogue, Vulkan instead).
+//! renderer.
 
 #[path = "vulkan_device.rs"]
 pub mod device;

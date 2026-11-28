@@ -1,4 +1,4 @@
-//! Platform: SDL3 window and NVIDIA driver interop (osu-framework
+//! Platform: SDL3 window and NVIDIA driver interop (
 //! `Platform/` analogue).
 
 #[path = "nvml.rs"]

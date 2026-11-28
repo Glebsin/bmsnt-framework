@@ -1,5 +1,4 @@
-//! Graphics: Vulkan backend, sprite batcher, primitives and shaders
-//! (osu-framework `Graphics/` analogue).
+//! Graphics: Vulkan backend, sprite batcher, primitives and shared shaders.
 
 #[path = "primitives.rs"]
 pub mod primitives;
