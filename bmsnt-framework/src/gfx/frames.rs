@@ -11,6 +11,20 @@ use ash::vk;
 /// frames in flight (and ring buffer slots)
 pub const FRAMES_IN_FLIGHT: usize = 8;
 
+/// Configurable frame count for controlled 2/4/8 comparisons (BMSNT_FIF env,
+/// clamped to 2..=8). Default stays 8 (IMMEDIATE benchmark scenario). Read
+/// once; the same value must size every slot-dependent buffer.
+pub fn frames_in_flight() -> usize {
+    static VAL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("BMSNT_FIF")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.clamp(2, 8))
+            .unwrap_or(FRAMES_IN_FLIGHT)
+    })
+}
+
 pub struct FramesInFlight {
     fences: Vec<vk::Fence>,
     img_sems: Vec<vk::Semaphore>,

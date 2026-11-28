@@ -73,6 +73,11 @@ impl Window {
         }
     }
 
+    /// True while the window is minimized (no drawable surface).
+    pub fn is_minimized(&self) -> bool {
+        unsafe { SDL_GetWindowFlags(self.handle) & SDL_WINDOW_MINIMIZED != 0 }
+    }
+
     pub fn destroy(&self) {
         unsafe {
             SDL_DestroyWindow(self.handle);

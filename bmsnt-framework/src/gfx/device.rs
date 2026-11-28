@@ -52,6 +52,9 @@ impl GfxContext {
         let validate = std::env::var("VALIDATE").is_ok();
         let mut debug_messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)> = None;
         let mut layers: Vec<*const i8> = Vec::new();
+        // VK_EXT_debug_utils may only be enabled (and its functions called)
+        // when the extension was actually requested for the instance
+        let mut debug_utils_enabled = false;
         let mut inst_exts: Vec<*const i8> = vec![
             c"VK_KHR_surface".as_ptr(),
             c"VK_KHR_win32_surface".as_ptr(),
@@ -69,6 +72,7 @@ impl GfxContext {
             if has_layer {
                 layers.push(c"VK_LAYER_KHRONOS_validation".as_ptr());
                 inst_exts.push(c"VK_EXT_debug_utils".as_ptr());
+                debug_utils_enabled = true;
                 crate::elog!("validation layer enabled");
             } else {
                 crate::elog!("validation layer not installed");
@@ -94,8 +98,8 @@ impl GfxContext {
 
         crate::elog!("instance created");
 
-        // debug messenger (only when validating with the layer installed)
-        if debug_messenger.is_none() && validate {
+        // debug messenger (only when VK_EXT_debug_utils was enabled above)
+        if debug_messenger.is_none() && debug_utils_enabled {
             let dbg = ash::ext::debug_utils::Instance::load(&entry, &instance);
             let name = c"bmsnt-framework".as_ptr();
             let info = vk::DebugUtilsMessengerCreateInfoEXT {
@@ -248,7 +252,9 @@ impl GfxContext {
     /// All device-level objects (swapchain, renderer resources, fences) must
     /// be destroyed before and rebuilt after this call.
     pub unsafe fn recreate_device(&mut self) -> Result<()> {
+        crate::elog!("recreate_device: destroy old");
         self.device.destroy_device(None);
+        crate::elog!("recreate_device: create new");
         let device = Self::create_device_for(&self.instance, self.pdevice, self.queue_family)?;
         self.queue = device.get_device_queue(self.queue_family, 0);
         self.swapchain_loader = ash::khr::swapchain::Device::load(&self.instance, &device);

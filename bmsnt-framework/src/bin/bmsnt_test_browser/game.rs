@@ -24,7 +24,6 @@ use crate::screens::{SpriteBatchScreen, TestCase};
 use crate::theme::{DESIGN_H, DESIGN_W};
 use crate::ui::{self, Layout, UiState};
 
-const FRAMES_IN_FLIGHT: usize = 8;
 const STATS_WINDOW_MS: u64 = 250;
 
 /// fixed-dt update stage (120 Hz)
@@ -37,11 +36,11 @@ type UiSig = (
     u32,
     u32, // mouse x, y
     i64,
-    u64, // fps text
-    bool, // flip status
-    bool, // ui.expanded
+    u64,           // fps text
+    bool,          // flip status
+    bool,          // ui.expanded
     Option<usize>, // ui.selected_test
-    bool, // ui.running
+    bool,          // ui.running
     u32,
     u32, // framebuffer size
 );
@@ -89,6 +88,8 @@ struct Game {
     /// cached UI layer: instances after ui::draw and text verts (reused while
     /// a scene runs — the UI does not change frame to frame)
     ui_snap: Vec<f32>,
+    /// true while a swapchain recreation is deferred (drawable is 0x0)
+    recreate_deferred: bool,
     ui_verts: Vec<bmsnt_framework::ui::text::Vertex>,
     /// last field: must be dropped AFTER ctx (the surface holds the hwnd)
     window: Window,
@@ -100,10 +101,19 @@ impl Game {
         let window = Window::new("bmsnt-test-browser", 1920, 1080)?;
         let ctx = GfxContext::new(window.hwnd())?;
         let swapchain = Swapchain::new(&ctx)?;
-        let mut renderer = Renderer::new(&ctx)?;
+        let mut renderer = Renderer::new(&ctx, swapchain.image_count())?;
         renderer.create_swapchain_objects(&ctx, &swapchain)?;
-        let sprites = SpriteBatcher::new(&ctx)?;
-        let frames = FramesInFlight::new(ctx.device(), FRAMES_IN_FLIGHT);
+        let sprites = SpriteBatcher::new(&ctx, swapchain.image_count())?;
+        bmsnt_framework::elog!(
+            "mapped regions: vertex={} instance={} (actual images={})",
+            renderer.vertex_region_capacity(),
+            sprites.instance_region_capacity(),
+            swapchain.image_count()
+        );
+        let frames = FramesInFlight::new(
+            ctx.device(),
+            bmsnt_framework::gfx::frames::frames_in_flight(),
+        );
 
         let mut input = InputCore::new();
         let act_quit = input.map(
@@ -148,6 +158,7 @@ impl Game {
             screen_names,
             ui_snap: Vec::new(),
             ui_verts: Vec::new(),
+            recreate_deferred: false,
             window,
         })
     }
@@ -172,6 +183,13 @@ impl Game {
                 break;
             }
 
+            // minimized: the drawable is 0x0 — skip the whole frame and wait
+            // instead of spinning acquire/recreate against a dead surface
+            if self.window.is_minimized() {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                continue;
+            }
+
             // update stage: fixed 120 Hz step, free-running render
             let now_inst = Instant::now();
             update_acc += (now_inst - last).as_secs_f64();
@@ -191,7 +209,10 @@ impl Game {
             // wedged — rebuild instead of hanging the window
             let mut fence_ok = false;
             for _ in 0..4 {
-                match self.frames.try_ensure_idle(self.ctx.device(), slot, 250_000_000) {
+                match self
+                    .frames
+                    .try_ensure_idle(self.ctx.device(), slot, 250_000_000)
+                {
                     Ok(true) => {
                         fence_ok = true;
                         break;
@@ -279,12 +300,10 @@ impl Game {
                 self.ui_snap.extend_from_slice(self.sprites.instances());
 
                 let t0 = Instant::now();
+                // snapshot the new UI content; image regions are written in
+                // write_image_verts/upload_region after each image's fence
+                // signals — never while its CB may still be in flight
                 self.renderer.upload_verts(&self.ui_verts);
-                // static UI: identical data in every ring slot, so old CBs
-                // stay valid between updates
-                for s_i in 0..FRAMES_IN_FLIGHT {
-                    self.sprites.upload_slot(self.ctx.device(), s_i);
-                }
                 for i in 0..self.swapchain.image_count() {
                     self.renderer.mark_dirty(i);
                 }
@@ -295,33 +314,43 @@ impl Game {
                 if !ui_changed {
                     // restore the cached UI layer (one section, full frame)
                     self.sprites.begin();
-                    self.sprites
-                        .push_cached(&self.ui_snap, [0.0, 0.0, w, h]);
+                    self.sprites.push_cached(&self.ui_snap, [0.0, 0.0, w, h])?;
                 }
                 if let Some(i) = scene_idx {
                     let screen = self.screens[i].as_mut();
                     let t = self.t_start.elapsed().as_secs_f32();
                     let t_sc0 = Instant::now();
-                    screen.draw(&mut self.sprites, layout.game, s, (w, h), t);
+                    screen.draw(&mut self.sprites, layout.game, s, (w, h), t)?;
                     self.stats.t_scene += t_sc0.elapsed().as_nanos();
                 }
-                // per-frame scene data: current slot only, every image's CB
-                // is re-recorded with it
-                let t0 = Instant::now();
-                self.sprites.upload_slot(self.ctx.device(), slot);
+                // per-frame scene data: the composed list is written to the
+                // acquired image's region below (after its fence wait), and
+                // every image's CB is re-recorded with it
                 for i in 0..self.swapchain.image_count() {
                     self.renderer.mark_dirty(i);
                 }
-                self.stats.t_rec += t0.elapsed().as_nanos();
             }
 
             // --- record (only images whose CB is stale) ---
             let img_idx_u = img_idx as usize;
-            let sprites_ref = if self.no_sprites { None } else { Some(&self.sprites) };
+            // the image fence MUST be waited on before any write to this
+            // image's mapped regions: the image owns its command buffer, so
+            // its fence covers every submission that can read those regions
+            // (cached resubmits from other frame slots included). It also
+            // guarantees the CB is not pending for reset/record below.
+            self.renderer
+                .ensure_image_idle(self.ctx.device(), img_idx_u)?;
+            self.renderer.write_image_verts(img_idx_u)?;
+            self.sprites.upload_region(img_idx_u)?;
+            let sprites_ref = if self.no_sprites {
+                None
+            } else {
+                Some(&self.sprites)
+            };
             if self.renderer.is_dirty(img_idx_u) {
                 let t0 = Instant::now();
                 self.renderer
-                    .record_frame(self.ctx.device(), img_idx_u, slot, sprites_ref)?;
+                    .record_frame(self.ctx.device(), img_idx_u, sprites_ref)?;
                 self.stats.t_rec += t0.elapsed().as_nanos();
             }
             let done_sem = self.swapchain.done_sem(img_idx_u);
@@ -512,10 +541,10 @@ impl Game {
             p_signal_semaphores: &done_sem,
             ..Default::default()
         };
-        let result = self
-            .ctx
-            .device()
-            .queue_submit(self.ctx.queue, &[submit], self.frames.fence(slot));
+        let result =
+            self.ctx
+                .device()
+                .queue_submit(self.ctx.queue, &[submit], self.frames.fence(slot));
         if let Err(vk::Result::ERROR_DEVICE_LOST) = result {
             // NVIDIA reports transient device lost during exclusive fullscreen
             // switches. Try the cheap path (swapchain recreation) first;
@@ -558,6 +587,26 @@ impl Game {
     /// If the device itself is lost (wait_idle fails), escalate to a full
     /// device-level rebuild.
     unsafe fn recreate(&mut self) -> Result<()> {
+        // a zero drawable (minimized) means no valid replacement extent
+        // exists: defer the whole recreation instead of destroying the old
+        // swapchain and creating an invalid 0x0 one
+        match Swapchain::drawable_extent(&self.ctx) {
+            // genuinely zero drawable (minimized): defer, keep the old stack
+            Ok(None) => {
+                if !self.recreate_deferred {
+                    self.recreate_deferred = true;
+                    bmsnt_framework::elog!("recreation deferred: drawable extent is 0x0");
+                }
+                return Ok(());
+            }
+            // a real Vulkan error must not be masked as "0x0 minimized"
+            Err(e) => {
+                bmsnt_framework::elog!("surface query failed: {e:#} — full rebuild");
+                return self.full_rebuild();
+            }
+            Ok(Some(_)) => {}
+        }
+        self.recreate_deferred = false;
         if self.ctx.device().device_wait_idle().is_err() {
             return self.full_rebuild();
         }
@@ -570,7 +619,14 @@ impl Game {
         bmsnt_framework::elog!("rebuild: swapchain");
         self.swapchain.destroy(self.ctx.device());
         self.swapchain = Swapchain::new(&self.ctx)?;
-        self.renderer.create_swapchain_objects(&self.ctx, &self.swapchain)?;
+        // capacity follows the ACTUAL returned image count; the device is
+        // idle here, so the mapped buffers can be replaced safely
+        self.sprites
+            .ensure_region_capacity(&self.ctx, self.swapchain.image_count())?;
+        self.renderer
+            .ensure_region_capacity(&self.ctx, self.swapchain.image_count())?;
+        self.renderer
+            .create_swapchain_objects(&self.ctx, &self.swapchain)?;
         bmsnt_framework::elog!(
             "swapchain recreated: {}x{}",
             self.swapchain.extent.width,
@@ -608,12 +664,29 @@ impl Game {
     }
 
     unsafe fn rebuild_device_stack(&mut self) -> Result<()> {
+        bmsnt_framework::elog!("rebuild_stack: device");
         self.ctx.recreate_device()?;
-        self.frames = FramesInFlight::new(self.ctx.device(), FRAMES_IN_FLIGHT);
-        self.sprites = SpriteBatcher::new(&self.ctx)?;
+        bmsnt_framework::elog!("rebuild_stack: frames");
+        self.frames = FramesInFlight::new(
+            self.ctx.device(),
+            bmsnt_framework::gfx::frames::frames_in_flight(),
+        );
+        bmsnt_framework::elog!("rebuild_stack: sprites");
+        self.sprites =
+            SpriteBatcher::new(&self.ctx, bmsnt_framework::gfx::frames::frames_in_flight())?;
+        bmsnt_framework::elog!("rebuild_stack: swapchain");
         self.swapchain = Swapchain::new(&self.ctx)?;
-        self.renderer = Renderer::new(&self.ctx)?;
-        self.renderer.create_swapchain_objects(&self.ctx, &self.swapchain)?;
+        bmsnt_framework::elog!("rebuild_stack: renderer");
+        self.renderer = Renderer::new(&self.ctx, self.swapchain.image_count())?;
+        // capacity follows the actual image count (the FIF-sized start guess
+        // may need to grow); device is fresh — no pending work on old buffers
+        self.sprites
+            .ensure_region_capacity(&self.ctx, self.swapchain.image_count())?;
+        self.renderer
+            .ensure_region_capacity(&self.ctx, self.swapchain.image_count())?;
+        bmsnt_framework::elog!("rebuild_stack: sc objects");
+        self.renderer
+            .create_swapchain_objects(&self.ctx, &self.swapchain)?;
         Ok(())
     }
 }

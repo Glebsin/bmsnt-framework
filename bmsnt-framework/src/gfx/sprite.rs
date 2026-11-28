@@ -14,7 +14,7 @@ use std::ptr;
 use ash::vk;
 
 use super::device::GfxContext;
-use super::frames::FRAMES_IN_FLIGHT;
+use super::renderer::check_region_index;
 
 /// per-frame instance limit
 pub const MAX_INSTANCES: usize = 4096;
@@ -62,14 +62,134 @@ pub struct SpriteBatcher {
     inst_buf: vk::Buffer,
     inst_mem: vk::DeviceMemory,
     inst_map: *mut u8,
+    /// number of per-image regions the instance allocation covers
+    inst_regions: usize,
+    /// allocation size in bytes (bounds-check base for region ranges)
+    inst_buf_bytes: u64,
     instances: Vec<f32>,
     /// current scissor for pushed instances
     cur_section: Option<[f32; 4]>,
     sections: Vec<Section>,
 }
 
+/// Bytes of one per-image instance region.
+const INSTANCE_REGION_BYTES: u64 = (MAX_INSTANCES * INSTANCE_BYTES) as u64;
+
+/// Allocate the host-visible per-image instance buffer: `regions` regions of
+/// MAX_INSTANCES instances each, mapped for CPU writes.
+///
+/// # Safety
+///
+/// `device` must be valid; the returned buffer/memory must be unmapped,
+/// destroyed and freed (in that order) before the device is destroyed.
+unsafe fn alloc_instance_regions(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    regions: usize,
+) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8, u64)> {
+    let buf_size = INSTANCE_REGION_BYTES * regions as u64;
+    let inst_buf = device
+        .create_buffer(
+            &vk::BufferCreateInfo {
+                size: buf_size,
+                usage: vk::BufferUsageFlags::VERTEX_BUFFER,
+                sharing_mode: vk::SharingMode::EXCLUSIVE,
+                ..Default::default()
+            },
+            None,
+        )
+        .map_err(|e| anyhow!("inst buf: {e:?}"))?;
+    let fail_buf = |e: anyhow::Error| {
+        unsafe { device.destroy_buffer(inst_buf, None) };
+        e
+    };
+    let req = device.get_buffer_memory_requirements(inst_buf);
+    let host_idx = (0..mem_props.memory_type_count)
+        .find(|i| {
+            let t = mem_props.memory_types[*i as usize];
+            req.memory_type_bits & (1 << i) != 0
+                && t.property_flags.contains(
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )
+        })
+        .ok_or_else(|| fail_buf(anyhow!("host visible memory type")))?;
+    let inst_mem = device
+        .allocate_memory(
+            &vk::MemoryAllocateInfo {
+                allocation_size: req.size,
+                memory_type_index: host_idx,
+                ..Default::default()
+            },
+            None,
+        )
+        .map_err(|e| fail_buf(anyhow!("inst mem: {e:?}")))?;
+    let fail_all = |e: anyhow::Error| {
+        // buffer must be destroyed before its bound memory is freed
+        unsafe { device.destroy_buffer(inst_buf, None) };
+        unsafe { device.free_memory(inst_mem, None) };
+        e
+    };
+    device
+        .bind_buffer_memory(inst_buf, inst_mem, 0)
+        .map_err(|e| fail_all(anyhow!("bind inst: {e:?}")))?;
+    let inst_map = device
+        .map_memory(inst_mem, 0, buf_size, vk::MemoryMapFlags::empty())
+        .map_err(|e| fail_all(anyhow!("map inst: {e:?}")))? as *mut u8;
+    Ok((inst_buf, inst_mem, inst_map, buf_size))
+}
+
+/// Validate that appending `add_f32` floats keeps the composed instance
+/// list within MAX_INSTANCES. Shared by push_cached; pure, unit-testable.
+pub(crate) fn check_cached_capacity(existing_f32: usize, add_f32: usize) -> Result<()> {
+    if add_f32 % INSTANCE_F32 != 0 {
+        return Err(anyhow!(
+            "cached instance data not a multiple of the instance stride"
+        ));
+    }
+    let total = existing_f32
+        .checked_add(add_f32)
+        .ok_or_else(|| anyhow!("instance list size overflow"))?;
+    if total > MAX_INSTANCES * INSTANCE_F32 {
+        return Err(anyhow!(
+            "sprite batch overflow: {} + {} instances exceeds MAX_INSTANCES {}",
+            existing_f32 / INSTANCE_F32,
+            add_f32 / INSTANCE_F32,
+            MAX_INSTANCES
+        ));
+    }
+    Ok(())
+}
+
+/// Validate one sprite section against the instance limit and the number
+/// of instances actually uploaded for the image being drawn. Checked
+/// arithmetic: never trusts stale or malformed section metadata.
+fn validate_section(first: usize, count: usize, uploaded: usize) -> Result<()> {
+    let end = first
+        .checked_add(count)
+        .ok_or_else(|| anyhow!("sprite section [{first}+{count}] overflows usize"))?;
+    if end > MAX_INSTANCES {
+        return Err(anyhow!(
+            "sprite section [{first}+{count}] exceeds MAX_INSTANCES {MAX_INSTANCES}"
+        ));
+    }
+    if end > uploaded {
+        return Err(anyhow!(
+            "sprite section [{first}+{count}] exceeds the {uploaded} uploaded instances"
+        ));
+    }
+    Ok(())
+}
+
 impl SpriteBatcher {
-    pub unsafe fn new(ctx: &GfxContext) -> Result<Self> {
+    /// Everything that does not depend on the current scene. `region_count`
+    /// must cover the ACTUAL swapchain image count; it can be grown later
+    /// via ensure_region_capacity().
+    ///
+    /// # Safety
+    ///
+    /// Creates Vulkan buffers/memory and maps them; `ctx` must be a valid
+    /// initialized GfxContext.
+    pub unsafe fn new(ctx: &GfxContext, region_count: usize) -> Result<Self> {
         let device = ctx.device();
 
         // --- bake the atlas (CPU, in memory; no image crate needed) ---
@@ -95,12 +215,15 @@ impl SpriteBatcher {
         };
         let atlas_img = device.create_image(&img_info, None).expect("atlas image");
         let img_req = device.get_image_memory_requirements(atlas_img);
-        let mem_props = ctx.instance().get_physical_device_memory_properties(ctx.pdevice);
+        let mem_props = ctx
+            .instance()
+            .get_physical_device_memory_properties(ctx.pdevice);
         let dev_local = (0..mem_props.memory_type_count)
             .find(|i| {
                 let t = mem_props.memory_types[*i as usize];
                 img_req.memory_type_bits & (1 << i) != 0
-                    && t.property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                    && t.property_flags
+                        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
             })
             .ok_or_else(|| anyhow!("device local memory type"))? as u32;
         let atlas_mem = device
@@ -113,7 +236,9 @@ impl SpriteBatcher {
                 None,
             )
             .expect("atlas mem");
-        device.bind_image_memory(atlas_img, atlas_mem, 0).expect("bind atlas");
+        device
+            .bind_image_memory(atlas_img, atlas_mem, 0)
+            .expect("bind atlas");
 
         // --- staging buffer + upload with a one-time command buffer ---
         let byte_size = pixels.len() as u64;
@@ -130,11 +255,13 @@ impl SpriteBatcher {
                 .find(|i| {
                     let t = mem_props.memory_types[*i as usize];
                     req.memory_type_bits & (1 << i) != 0
-                        && t
-                            .property_flags
-                            .contains(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
+                        && t.property_flags.contains(
+                            vk::MemoryPropertyFlags::HOST_VISIBLE
+                                | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        )
                 })
-                .ok_or_else(|| anyhow!("host visible memory type"))? as u32;
+                .ok_or_else(|| anyhow!("host visible memory type"))?
+                as u32;
             let mem = device
                 .allocate_memory(
                     &vk::MemoryAllocateInfo {
@@ -145,7 +272,9 @@ impl SpriteBatcher {
                     None,
                 )
                 .expect("staging mem");
-            device.bind_buffer_memory(buf, mem, 0).expect("bind staging");
+            device
+                .bind_buffer_memory(buf, mem, 0)
+                .expect("bind staging");
             let map = device
                 .map_memory(mem, 0, byte_size, vk::MemoryMapFlags::empty())
                 .expect("map staging");
@@ -533,43 +662,9 @@ impl SpriteBatcher {
         let pipeline = pipelines[0];
         device.destroy_shader_module(sm, None);
 
-        // --- instance ring buffer (host visible, one slot per frame) ---
-        let buf_size = (MAX_INSTANCES * INSTANCE_BYTES * FRAMES_IN_FLIGHT) as u64;
-        let inst_buf = device
-            .create_buffer(
-                &vk::BufferCreateInfo {
-                    size: buf_size,
-                    usage: vk::BufferUsageFlags::VERTEX_BUFFER,
-                    sharing_mode: vk::SharingMode::EXCLUSIVE,
-                    ..Default::default()
-                },
-                None,
-            )
-            .expect("inst buf");
-        let req = device.get_buffer_memory_requirements(inst_buf);
-        let host_idx = (0..mem_props.memory_type_count)
-            .find(|i| {
-                let t = mem_props.memory_types[*i as usize];
-                req.memory_type_bits & (1 << i) != 0
-                    && t
-                        .property_flags
-                        .contains(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
-            })
-            .ok_or_else(|| anyhow!("host visible memory type"))? as u32;
-        let inst_mem = device
-            .allocate_memory(
-                &vk::MemoryAllocateInfo {
-                    allocation_size: req.size,
-                    memory_type_index: host_idx,
-                    ..Default::default()
-                },
-                None,
-            )
-            .expect("inst mem");
-        device.bind_buffer_memory(inst_buf, inst_mem, 0).expect("bind inst");
-        let inst_map = device
-            .map_memory(inst_mem, 0, buf_size, vk::MemoryMapFlags::empty())
-            .expect("map inst") as *mut u8;
+        // --- instance ring buffer (host visible, one region per image) ---
+        let (inst_buf, inst_mem, inst_map, inst_buf_bytes) =
+            unsafe { alloc_instance_regions(device, &mem_props, region_count)? };
 
         Ok(Self {
             pipeline,
@@ -584,6 +679,8 @@ impl SpriteBatcher {
             inst_buf,
             inst_mem,
             inst_map,
+            inst_regions: region_count,
+            inst_buf_bytes,
             instances: Vec::new(),
             cur_section: None,
             sections: Vec::new(),
@@ -606,14 +703,11 @@ impl SpriteBatcher {
 
     /// Push pre-built instances that all share one scissor rect; restores
     /// them as a single section (used to re-apply a cached UI layer without
-    /// rebuilding its geometry).
-    pub fn push_cached(&mut self, data: &[f32], sc: [f32; 4]) {
-        debug_assert!(
-            data.len() % INSTANCE_F32 == 0,
-            "cached instance data not a multiple of the instance stride"
-        );
+    /// rebuilding its geometry). Errors instead of exceeding MAX_INSTANCES.
+    pub fn push_cached(&mut self, data: &[f32], sc: [f32; 4]) -> Result<()> {
+        check_cached_capacity(self.instances.len(), data.len())?;
         if data.is_empty() {
-            return;
+            return Ok(());
         }
         let first = (self.instances.len() / INSTANCE_F32) as u32;
         self.instances.extend_from_slice(data);
@@ -622,6 +716,7 @@ impl SpriteBatcher {
             count: (data.len() / INSTANCE_F32) as u32,
             sc,
         });
+        Ok(())
     }
 
     /// Set the scissor rect (framebuffer pixels) for subsequent sprites.
@@ -667,7 +762,15 @@ impl SpriteBatcher {
     }
 
     /// Solid tinted rectangle (white atlas patch, sharp edges).
-    pub fn solid(&mut self, x: f32, y: f32, w: f32, h: f32, color: (f32, f32, f32), res: (f32, f32)) {
+    pub fn solid(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        color: (f32, f32, f32),
+        res: (f32, f32),
+    ) {
         self.sprite(x, y, w, h, WHITE_UV, (color.0, color.1, color.2, 1.0), res);
     }
 
@@ -704,28 +807,66 @@ impl SpriteBatcher {
         res: (f32, f32),
     ) {
         self.push([
-            x, y, w, h, 0.0, 0.0, 0.0, 1.0, top.0, top.1, top.2, 1.0, bottom.0, bottom.1,
-            bottom.2, 1.0, 1.0, res.0, res.1, 0.0,
+            x, y, w, h, 0.0, 0.0, 0.0, 1.0, top.0, top.1, top.2, 1.0, bottom.0, bottom.1, bottom.2,
+            1.0, 1.0, res.0, res.1, 0.0,
         ]);
     }
 
     // --- GPU side ---
 
-    /// Copy the current instance list into the ring slot of this frame.
-    pub unsafe fn upload_slot(&mut self, _device: &ash::Device, slot: usize) {
+    /// Write the current composed instance list into `img_idx`'s mapped
+    /// region.
+    ///
+    /// # Safety
+    ///
+    /// The image fence for `img_idx` must have been waited on first
+    /// (ensure_image_idle): the image owns its command buffer — the only
+    /// GPU consumer of this region — and all its submissions are complete.
+    pub unsafe fn upload_region(&mut self, img_idx: usize) -> Result<()> {
+        if self.instances.len() > MAX_INSTANCES * INSTANCE_F32 {
+            return Err(anyhow!(
+                "upload_region(img {img_idx}): instance list {} exceeds MAX_INSTANCES {}",
+                self.instances.len() / INSTANCE_F32,
+                MAX_INSTANCES
+            ));
+        }
+        check_region_index(
+            img_idx,
+            self.inst_regions,
+            INSTANCE_REGION_BYTES,
+            self.inst_buf_bytes,
+        )
+        .map_err(|e| anyhow!("upload_region(img {img_idx}): {e:#}"))?;
         let n = self.instances.len() / INSTANCE_F32;
-        let base = self.inst_map.add(slot * MAX_INSTANCES * INSTANCE_BYTES);
+        let base = self.inst_map.add(img_idx * MAX_INSTANCES * INSTANCE_BYTES);
         if n > 0 {
             let src = self.instances.as_ptr() as *const u8;
             let len = n * INSTANCE_BYTES;
             ptr::copy_nonoverlapping(src, base, len);
         }
+        Ok(())
     }
 
-    /// Bind the sprite pipeline and draw all sections of this frame's slot,
-    /// setting each section's scissor. Must be called inside an active
-    /// rendering scope (viewport must already be set).
-    pub unsafe fn draw(&self, device: &ash::Device, cmd: vk::CommandBuffer, slot: usize) {
+    /// Bind the sprite pipeline and draw all sections of this image's
+    /// region, setting each section's scissor. Must be called inside an
+    /// active rendering scope (viewport must already be set).
+    ///
+    /// # Safety
+    ///
+    /// Active rendering scope required; the image fence for `img_idx` must
+    /// have been waited on (the region is the image's exclusively).
+    pub unsafe fn draw(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        img_idx: usize,
+    ) -> Result<()> {
+        check_region_index(
+            img_idx,
+            self.inst_regions,
+            INSTANCE_REGION_BYTES,
+            self.inst_buf_bytes,
+        )?;
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
         device.cmd_bind_descriptor_sets(
             cmd,
@@ -735,7 +876,11 @@ impl SpriteBatcher {
             &[self.desc_set],
             &[],
         );
+        // the composed list was uploaded to this image's region this frame;
+        // every section must lie inside the limit and that uploaded content
+        let uploaded = self.instances.len() / INSTANCE_F32;
         for s in &self.sections {
+            validate_section(s.first_instance as usize, s.count as usize, uploaded)?;
             let off = vk::Offset2D {
                 x: s.sc[0].max(0.0) as i32,
                 y: s.sc[1].max(0.0) as i32,
@@ -744,20 +889,86 @@ impl SpriteBatcher {
                 width: (s.sc[2].max(0.0).min(8192.0)) as u32,
                 height: (s.sc[3].max(0.0).min(8192.0)) as u32,
             };
-            device.cmd_set_scissor(cmd, 0, &[vk::Rect2D { offset: off, extent: ext }]);
-            // address the section through the bind offset: the ring slot's
-            // instances live at slot * MAX_INSTANCES within the shared buffer
+            device.cmd_set_scissor(
+                cmd,
+                0,
+                &[vk::Rect2D {
+                    offset: off,
+                    extent: ext,
+                }],
+            );
+            // address the section through the bind offset: this image's
+            // instances live at img_idx * MAX_INSTANCES within the shared
+            // buffer; checked range math, before any bind/draw
             let byte_off =
-                ((slot * MAX_INSTANCES + s.first_instance as usize) * INSTANCE_BYTES) as vk::DeviceSize;
+                ((img_idx * MAX_INSTANCES + s.first_instance as usize) * INSTANCE_BYTES) as u64;
+            let byte_end = byte_off + (s.count as u64) * INSTANCE_BYTES as u64;
+            let region_end = (img_idx as u64 + 1) * MAX_INSTANCES as u64 * INSTANCE_BYTES as u64;
+            if byte_end > region_end {
+                return Err(anyhow!(
+                    "sprite section [{}, {}) exceeds image {} region bounds",
+                    s.first_instance,
+                    s.first_instance as usize + s.count as usize,
+                    img_idx
+                ));
+            }
+            let byte_off = byte_off as vk::DeviceSize;
             device.cmd_bind_vertex_buffers(cmd, 0, &[self.inst_buf], &[byte_off]);
             device.cmd_draw(cmd, 6, s.count, 0, 0);
         }
+        Ok(())
+    }
+
+    /// Number of per-image instance regions the mapped allocation covers.
+    pub fn instance_region_capacity(&self) -> usize {
+        self.inst_regions
+    }
+
+    /// Grow the instance region allocation to cover `image_count` regions.
+    ///
+    /// # Safety
+    ///
+    /// No GPU work may reference the old buffer: call only with the device
+    /// idle (swapchain recreation path) or on a freshly rebuilt device.
+    pub unsafe fn ensure_region_capacity(
+        &mut self,
+        ctx: &GfxContext,
+        image_count: usize,
+    ) -> Result<()> {
+        if image_count <= self.inst_regions {
+            return Ok(());
+        }
+        crate::elog!(
+            "instance regions: {} -> {} (actual swapchain images)",
+            self.inst_regions,
+            image_count
+        );
+        let device = ctx.device();
+        let mem_props = ctx
+            .instance()
+            .get_physical_device_memory_properties(ctx.pdevice);
+        // allocate the replacement FIRST: on any failure the old allocation
+        // stays intact and usable (transactional growth)
+        let (inst_buf, inst_mem, inst_map, inst_buf_bytes) =
+            unsafe { alloc_instance_regions(device, &mem_props, image_count)? };
+        // replacement fully initialized — only now retire the old allocation
+        // (unmap, then destroy the buffer to release the memory binding, then free)
+        unsafe { device.unmap_memory(self.inst_mem) };
+        unsafe { device.destroy_buffer(self.inst_buf, None) };
+        unsafe { device.free_memory(self.inst_mem, None) };
+        self.inst_buf = inst_buf;
+        self.inst_mem = inst_mem;
+        self.inst_map = inst_map;
+        self.inst_regions = image_count;
+        self.inst_buf_bytes = inst_buf_bytes;
+        Ok(())
     }
 
     pub unsafe fn destroy(&self, device: &ash::Device) {
+        // unmap, then destroy the buffer (releases the memory binding), then free
         device.unmap_memory(self.inst_mem);
-        device.free_memory(self.inst_mem, None);
         device.destroy_buffer(self.inst_buf, None);
+        device.free_memory(self.inst_mem, None);
         device.destroy_descriptor_pool(self.desc_pool, None);
         device.destroy_descriptor_set_layout(self.desc_layout, None);
         device.destroy_sampler(self.sampler, None);
@@ -792,10 +1003,7 @@ fn bake_atlas() -> Vec<u8> {
         let half = (w / 2.0 - rad as f32, h / 2.0 - rad as f32);
         for y in 0..h as u32 {
             for x in 0..w as u32 {
-                let p = (
-                    x as f32 - w / 2.0 + 0.5,
-                    y as f32 - h / 2.0 + 0.5,
-                );
+                let p = (x as f32 - w / 2.0 + 0.5, y as f32 - h / 2.0 + 0.5);
                 let q = (p.0.abs() - half.0, p.1.abs() - half.1);
                 let d_out = q.0.max(0.0).hypot(q.1.max(0.0));
                 let d_in = q.0.max(q.1).min(0.0);
@@ -821,4 +1029,39 @@ fn u32_slice(bytes: &[u8]) -> Vec<u32> {
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_cached_capacity, validate_section, INSTANCE_F32, MAX_INSTANCES};
+
+    #[test]
+    fn cached_push_at_and_over_limit() {
+        // exactly MAX_INSTANCES is fine
+        let full = MAX_INSTANCES * INSTANCE_F32;
+        assert!(check_cached_capacity(0, full).is_ok());
+        // one more instance exceeds the limit
+        assert!(check_cached_capacity(0, full + INSTANCE_F32).is_err());
+        // partially filled list: remaining space is ok, +1 is not
+        let half = (MAX_INSTANCES / 2) * INSTANCE_F32;
+        assert!(check_cached_capacity(half, half).is_ok());
+        assert!(check_cached_capacity(half, half + INSTANCE_F32).is_err());
+        // stride mismatch and overflow are rejected
+        assert!(check_cached_capacity(0, full + 1).is_err());
+        assert!(check_cached_capacity(usize::MAX, full).is_err());
+    }
+
+    #[test]
+    fn section_range_bounds() {
+        let uploaded = 100usize;
+        assert!(validate_section(0, 100, uploaded).is_ok());
+        assert!(validate_section(50, 50, uploaded).is_ok());
+        // beyond the uploaded content of this image
+        assert!(validate_section(50, 51, uploaded).is_err());
+        // beyond MAX_INSTANCES even if uploaded were larger
+        assert!(validate_section(0, MAX_INSTANCES + 1, uploaded).is_err());
+        assert!(validate_section(MAX_INSTANCES, 1, uploaded).is_err());
+        // checked arithmetic
+        assert!(validate_section(usize::MAX, 1, uploaded).is_err());
+    }
 }

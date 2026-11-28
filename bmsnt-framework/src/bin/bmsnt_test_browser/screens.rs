@@ -14,8 +14,15 @@ pub trait TestCase {
 
     /// Draw one frame of the scene. `view` — game-view rect in design space,
     /// `s` — design->framebuffer scale, `res` — framebuffer size,
-    /// `t` — seconds since app start.
-    fn draw(&mut self, sprites: &mut SpriteBatcher, view: Rect, s: f32, res: (f32, f32), t: f32);
+    /// `t` — seconds since app start. Errors abort the frame before submit.
+    fn draw(
+        &mut self,
+        sprites: &mut SpriteBatcher,
+        view: Rect,
+        s: f32,
+        res: (f32, f32),
+        t: f32,
+    ) -> anyhow::Result<()>;
 }
 
 /// stress scene: moving rounded sprites (target 1% low < 1 ms)
@@ -67,26 +74,8 @@ impl SpriteBatchScreen {
                 0.5 + 0.5 * (fi * 0.017 + 4.0).sin(),
             );
             data.extend_from_slice(&[
-                bx,
-                by,
-                size,
-                size,
-                uv[0],
-                uv[1],
-                uv[2],
-                uv[3],
-                color.0,
-                color.1,
-                color.2,
-                1.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                res.0,
-                res.1,
-                0.0,
+                bx, by, size, size, uv[0], uv[1], uv[2], uv[3], color.0, color.1, color.2, 1.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, res.0, res.1, 0.0,
             ]);
         }
         self.base = Some((data, base_pos, view.w, view.h));
@@ -98,7 +87,14 @@ impl TestCase for SpriteBatchScreen {
         "SpriteBatch"
     }
 
-    fn draw(&mut self, sprites: &mut SpriteBatcher, view: Rect, s: f32, res: (f32, f32), t: f32) {
+    fn draw(
+        &mut self,
+        sprites: &mut SpriteBatcher,
+        view: Rect,
+        s: f32,
+        res: (f32, f32),
+        t: f32,
+    ) -> anyhow::Result<()> {
         let fb = (view.x * s, view.y * s, view.w * s, view.h * s);
         sprites.begin_section(fb.0, fb.1, fb.2, fb.3);
 
@@ -131,6 +127,7 @@ impl TestCase for SpriteBatchScreen {
             data[o + 1] = snap(y);
         }
         // one batched section push instead of 1200 individual ones
-        sprites.push_cached(data, [fb.0, fb.1, fb.2, fb.3]);
+        sprites.push_cached(data, [fb.0, fb.1, fb.2, fb.3])?;
+        Ok(())
     }
 }

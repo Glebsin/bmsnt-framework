@@ -39,16 +39,42 @@ pub struct Swapchain {
 }
 
 impl Swapchain {
+    /// Current drawable extent, or None when the surface reports a zero
+    /// size (minimized window): no valid swapchain can exist then. A Vulkan
+    /// query error is returned as Err — it must not be conflated with the
+    /// minimized state.
+    pub fn drawable_extent(ctx: &GfxContext) -> Result<Option<vk::Extent2D>> {
+        let mut caps = vk::SurfaceCapabilitiesKHR::default();
+        let sfp = ctx.surface_instance().fp();
+        let r = unsafe {
+            (sfp.get_physical_device_surface_capabilities_khr)(
+                ctx.pdevice,
+                ctx.surface(),
+                &mut caps,
+            )
+        };
+        if r != vk::Result::SUCCESS {
+            return Err(anyhow!("surface capabilities query failed: {r:?}"));
+        }
+        if caps.current_extent.width == 0 || caps.current_extent.height == 0 {
+            Ok(None)
+        } else if caps.current_extent.width == u32::MAX {
+            Ok(Some(vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            }))
+        } else {
+            Ok(Some(caps.current_extent))
+        }
+    }
+
     pub unsafe fn new(ctx: &GfxContext) -> Result<Self> {
         let device = ctx.device();
         let sfp = ctx.surface_instance().fp();
 
         let mut caps = vk::SurfaceCapabilitiesKHR::default();
-        if (sfp.get_physical_device_surface_capabilities_khr)(
-            ctx.pdevice,
-            ctx.surface(),
-            &mut caps,
-        ) != vk::Result::SUCCESS
+        if (sfp.get_physical_device_surface_capabilities_khr)(ctx.pdevice, ctx.surface(), &mut caps)
+            != vk::Result::SUCCESS
         {
             return Err(anyhow!("surface capabilities"));
         }
@@ -82,6 +108,8 @@ impl Swapchain {
         if caps.max_image_count > 0 && image_count > caps.max_image_count {
             image_count = caps.max_image_count;
         }
+        // note: the ACTUAL returned count may still exceed this request; the
+        // per-image mapped buffers follow it via ensure_region_capacity()
 
         let extent = if caps.current_extent.width != u32::MAX {
             caps.current_extent
@@ -91,6 +119,11 @@ impl Swapchain {
                 height: 1080,
             }
         };
+        // a defined 0x0 extent means the drawable is unavailable (minimized
+        // window): never create a swapchain at an invalid size
+        if extent.width == 0 || extent.height == 0 {
+            return Err(anyhow!("drawable extent is 0x0 (window minimized?)"));
+        }
 
         let sc_info = vk::SwapchainCreateInfoKHR {
             surface: ctx.surface(),
@@ -119,9 +152,8 @@ impl Swapchain {
             }
             out
         };
-        let images = query_vec(|n, p| {
-            (loader.fp().get_swapchain_images_khr)(device.handle(), handle, n, p)
-        });
+        let images =
+            query_vec(|n, p| (loader.fp().get_swapchain_images_khr)(device.handle(), handle, n, p));
         if images.is_empty() {
             return Err(anyhow!("swapchain has no images"));
         }
@@ -208,9 +240,7 @@ impl Swapchain {
 }
 
 /// Two-step array query (count first, then data).
-pub unsafe fn query_vec<T>(
-    mut call: impl FnMut(*mut u32, *mut T) -> vk::Result,
-) -> Vec<T> {
+pub unsafe fn query_vec<T>(mut call: impl FnMut(*mut u32, *mut T) -> vk::Result) -> Vec<T> {
     let mut n = 0u32;
     let _ = call(&mut n, ptr::null_mut());
     let mut v: Vec<T> = Vec::with_capacity(n as usize);

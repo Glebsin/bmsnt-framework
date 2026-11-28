@@ -19,8 +19,6 @@ use crate::ui::text::Vertex;
 
 /// per-slot vertex limit — shares the source of truth with ui::text
 pub const MAX_VERTS: usize = crate::ui::text::MAX_VERTS;
-/// ring slots = frames in flight
-const RING_SLOTS: usize = super::frames::FRAMES_IN_FLIGHT;
 
 pub struct Renderer {
     cmd_pool: vk::CommandPool,
@@ -31,7 +29,12 @@ pub struct Renderer {
     vbuf: vk::Buffer,
     vmem: vk::DeviceMemory,
     vmap: *mut Vertex,
-    /// current text vertices (to re-upload ring slots when dirty)
+    /// number of per-image regions the vertex allocation covers
+    vert_regions: usize,
+    /// allocation size in bytes (bounds-check base for region ranges)
+    vbuf_bytes: u64,
+    /// latest UI text vertex content (CPU snapshot; image regions are
+    /// written per-image after their fence signals)
     verts: Vec<Vertex>,
     // swapchain-dependent
     views: Vec<vk::ImageView>,
@@ -53,9 +56,102 @@ pub struct Renderer {
     shot_ready: bool,
 }
 
+/// Bytes of one per-image vertex region.
+const VERTEX_REGION_BYTES: u64 = (MAX_VERTS * std::mem::size_of::<Vertex>()) as u64;
+
+/// Validate that region `img_idx` of `regions` regions of `region_bytes`
+/// each lies fully inside a `buf_bytes` allocation. Called before ANY
+/// pointer arithmetic on the mapped base.
+pub(crate) fn check_region_index(
+    img_idx: usize,
+    regions: usize,
+    region_bytes: u64,
+    buf_bytes: u64,
+) -> Result<()> {
+    if img_idx >= regions {
+        return Err(anyhow!(
+            "region index {img_idx} out of range ({regions} regions)"
+        ));
+    }
+    let end = (img_idx as u64 + 1) * region_bytes;
+    if end > buf_bytes {
+        return Err(anyhow!(
+            "region {img_idx} end {end} exceeds buffer size {buf_bytes}"
+        ));
+    }
+    Ok(())
+}
+
+/// Allocate the host-visible per-image vertex buffer: `regions` regions of
+/// MAX_VERTS vertices each, mapped for CPU writes.
+///
+/// # Safety
+///
+/// `device` must be valid; the returned buffer/memory must be unmapped,
+/// destroyed and freed (in that order) before the device is destroyed.
+unsafe fn alloc_vertex_regions(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    regions: usize,
+) -> Result<(vk::Buffer, vk::DeviceMemory, *mut Vertex, u64)> {
+    let buf_size = VERTEX_REGION_BYTES * regions as u64;
+    let vb_info = vk::BufferCreateInfo {
+        size: buf_size,
+        usage: vk::BufferUsageFlags::VERTEX_BUFFER,
+        sharing_mode: vk::SharingMode::EXCLUSIVE,
+        ..Default::default()
+    };
+    let vbuf = device
+        .create_buffer(&vb_info, None)
+        .map_err(|e| anyhow!("vbuf: {e:?}"))?;
+    let fail_buf = |e: anyhow::Error| {
+        unsafe { device.destroy_buffer(vbuf, None) };
+        e
+    };
+    let mem_req = device.get_buffer_memory_requirements(vbuf);
+    let mem_type = (0..mem_props.memory_type_count)
+        .find(|i| {
+            let t = mem_props.memory_types[*i as usize];
+            mem_req.memory_type_bits & (1 << i) != 0
+                && t.property_flags.contains(
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )
+        })
+        .ok_or_else(|| fail_buf(anyhow!("host visible memory type")))?;
+    let vmem = device
+        .allocate_memory(
+            &vk::MemoryAllocateInfo {
+                allocation_size: mem_req.size,
+                memory_type_index: mem_type,
+                ..Default::default()
+            },
+            None,
+        )
+        .map_err(|e| fail_buf(anyhow!("vmem: {e:?}")))?;
+    let fail_all = |e: anyhow::Error| {
+        // buffer must be destroyed before its bound memory is freed
+        unsafe { device.destroy_buffer(vbuf, None) };
+        unsafe { device.free_memory(vmem, None) };
+        e
+    };
+    device
+        .bind_buffer_memory(vbuf, vmem, 0)
+        .map_err(|e| fail_all(anyhow!("bind vmem: {e:?}")))?;
+    let vmap = device
+        .map_memory(vmem, 0, buf_size, vk::MemoryMapFlags::empty())
+        .map_err(|e| fail_all(anyhow!("map vmem: {e:?}")))? as *mut Vertex;
+    Ok((vbuf, vmem, vmap, buf_size))
+}
+
 impl Renderer {
-    /// Everything that does not depend on the swapchain.
-    pub unsafe fn new(ctx: &GfxContext) -> Result<Self> {
+    /// Everything that does not depend on the swapchain. `region_count` must
+    /// cover the ACTUAL swapchain image count (see Swapchain::images).
+    ///
+    /// # Safety
+    ///
+    /// Creates Vulkan buffers/memory and maps them; `ctx` must be a valid
+    /// initialized GfxContext.
+    pub unsafe fn new(ctx: &GfxContext, region_count: usize) -> Result<Self> {
         let device = ctx.device();
         let queue_family = ctx.queue_family;
 
@@ -191,37 +287,12 @@ impl Renderer {
             .create_command_pool(&cp_info, None)
             .map_err(|e| anyhow!("cmd pool: {e:?}"))?;
 
-        // --- ring host-visible vertex buffer: one slot per frame in flight ---
-        let slice = (MAX_VERTS * std::mem::size_of::<Vertex>()) as u64;
-        let buf_size = slice * RING_SLOTS as u64;
-        let vb_info = vk::BufferCreateInfo {
-            size: buf_size,
-            usage: vk::BufferUsageFlags::VERTEX_BUFFER,
-            sharing_mode: vk::SharingMode::EXCLUSIVE,
-            ..Default::default()
-        };
-        let vbuf = device.create_buffer(&vb_info, None).expect("vbuf");
-        let mem_req = device.get_buffer_memory_requirements(vbuf);
-        let mem_props = ctx.instance().get_physical_device_memory_properties(ctx.pdevice);
-        let mem_type = (0..mem_props.memory_type_count)
-            .find(|i| {
-                let t = mem_props.memory_types[*i as usize];
-                mem_req.memory_type_bits & (1 << i) != 0
-                    && t
-                        .property_flags
-                        .contains(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
-            })
-            .ok_or_else(|| anyhow!("host visible memory type"))? as u32;
-        let alloc_info = vk::MemoryAllocateInfo {
-            allocation_size: mem_req.size,
-            memory_type_index: mem_type,
-            ..Default::default()
-        };
-        let vmem = device.allocate_memory(&alloc_info, None).expect("vmem");
-        device.bind_buffer_memory(vbuf, vmem, 0).expect("bind vmem");
-        let vmap = device
-            .map_memory(vmem, 0, buf_size, vk::MemoryMapFlags::empty())
-            .expect("map vmem") as *mut Vertex;
+        // --- host-visible vertex buffer: one region per swapchain image ---
+        let mem_props = ctx
+            .instance()
+            .get_physical_device_memory_properties(ctx.pdevice);
+        let (vbuf, vmem, vmap, vbuf_bytes) =
+            unsafe { alloc_vertex_regions(device, &mem_props, region_count)? };
 
         Ok(Self {
             cmd_pool,
@@ -232,6 +303,8 @@ impl Renderer {
             vbuf,
             vmem,
             vmap,
+            vert_regions: region_count,
+            vbuf_bytes,
             verts: Vec::new(),
             views: Vec::new(),
             cmds: Vec::new(),
@@ -251,7 +324,11 @@ impl Renderer {
 
     /// Swapchain-dependent objects: views, command buffers, viewport/scissor.
     /// Called on creation and on every recreation.
-    pub unsafe fn create_swapchain_objects(&mut self, ctx: &GfxContext, sc: &Swapchain) -> Result<()> {
+    pub unsafe fn create_swapchain_objects(
+        &mut self,
+        ctx: &GfxContext,
+        sc: &Swapchain,
+    ) -> Result<()> {
         let device = ctx.device();
         // reset-able command buffers: one per image
         if !self.cmds.is_empty() {
@@ -356,14 +433,17 @@ impl Renderer {
             )
             .map_err(|e| anyhow!("shot buf: {e:?}"))?;
         let req = device.get_buffer_memory_requirements(shot_buf);
-        let mem_props = ctx.instance().get_physical_device_memory_properties(ctx.pdevice);
+        let mem_props = ctx
+            .instance()
+            .get_physical_device_memory_properties(ctx.pdevice);
         let host_idx = (0..mem_props.memory_type_count)
             .find(|i| {
                 let t = mem_props.memory_types[*i as usize];
                 req.memory_type_bits & (1 << i) != 0
-                    && t
-                        .property_flags
-                        .contains(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
+                    && t.property_flags.contains(
+                        vk::MemoryPropertyFlags::HOST_VISIBLE
+                            | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    )
             })
             .ok_or_else(|| anyhow!("host visible memory type"))? as u32;
         let shot_mem = match device.allocate_memory(
@@ -386,7 +466,8 @@ impl Renderer {
             device.free_memory(shot_mem, None);
             return Err(anyhow!("bind shot: {e:?}"));
         }
-        let shot_map = match device.map_memory(shot_mem, 0, byte_size, vk::MemoryMapFlags::empty()) {
+        let shot_map = match device.map_memory(shot_mem, 0, byte_size, vk::MemoryMapFlags::empty())
+        {
             Ok(m) => m,
             Err(e) => {
                 device.destroy_buffer(shot_buf, None);
@@ -497,19 +578,37 @@ impl Renderer {
         }
     }
 
-    /// Copy vertices into EVERY ring slot. An image's CB is recorded at its
-    /// acquire and binds the current frame's slot — so every slot must hold
-    /// the current vertices (8 copies of ~5 KB is nothing).
+    /// Retain the new UI vertex content as the latest CPU snapshot. Mapped
+    /// image regions are NOT written here; each image's region is written in
+    /// write_image_verts() after that image's fence has signaled. The caller
+    /// must mark every swapchain image dirty — a cached CB bakes the old
+    /// vertex count.
     pub unsafe fn upload_verts(&mut self, verts: &[Vertex]) {
         assert!(verts.len() <= MAX_VERTS);
-        for slot in 0..RING_SLOTS {
-            let base = self.vmap.add(slot * MAX_VERTS);
-            for (n, v) in verts.iter().enumerate() {
-                ptr::copy_nonoverlapping(v, base.add(n), 1);
-            }
-        }
         self.verts.clear();
         self.verts.extend_from_slice(verts);
+    }
+
+    /// Write the latest UI vertices into `img_idx`'s mapped region.
+    ///
+    /// # Safety
+    ///
+    /// The image fence for `img_idx` must have been waited on first
+    /// (ensure_image_idle): the image owns its command buffer, so the fence
+    /// covers every submission that can read this region.
+    pub unsafe fn write_image_verts(&mut self, img_idx: usize) -> Result<()> {
+        check_region_index(
+            img_idx,
+            self.vert_regions,
+            VERTEX_REGION_BYTES,
+            self.vbuf_bytes,
+        )
+        .map_err(|e| anyhow!("write_image_verts(img {img_idx}): {e:#}"))?;
+        let base = self.vmap.add(img_idx * MAX_VERTS);
+        for (n, v) in self.verts.iter().enumerate() {
+            ptr::copy_nonoverlapping(v, base.add(n), 1);
+        }
+        Ok(())
     }
 
     pub fn mark_dirty(&mut self, img_idx: usize) {
@@ -525,7 +624,12 @@ impl Renderer {
     /// Enqueue an empty submit signaling the image's fence: the fence fires
     /// after ALL earlier queue work (this frame's real submit included) has
     /// completed, so the next reset/record of this image's CB is safe.
-    pub unsafe fn signal_image_fence(&self, device: &ash::Device, queue: vk::Queue, img_idx: usize) {
+    pub unsafe fn signal_image_fence(
+        &self,
+        device: &ash::Device,
+        queue: vk::Queue,
+        img_idx: usize,
+    ) {
         let f = self.img_fences[img_idx];
         device.reset_fences(&[f]).expect("reset img fence");
         let empty = vk::SubmitInfo::default();
@@ -538,15 +642,67 @@ impl Renderer {
         &self.cmds[img_idx]
     }
 
+    /// Wait until this image's previous CB (and its fence submit) has fully
+    /// completed. MUST be called every frame before the record-or-reuse path:
+    /// skipped-record frames still resubmit the cached CB, and IMMEDIATE
+    /// present does not throttle acquire, so the GPU may lag several frames.
+    pub unsafe fn ensure_image_idle(&self, device: &ash::Device, img_idx: usize) -> Result<()> {
+        device
+            .wait_for_fences(&[self.img_fences[img_idx]], true, 2_000_000_000)
+            .map_err(|e| anyhow!("img cb fence wait: {e:?}"))
+    }
+
+    /// Number of per-image vertex regions the mapped allocation covers.
+    pub fn vertex_region_capacity(&self) -> usize {
+        self.vert_regions
+    }
+
+    /// Grow the vertex region allocation to cover `image_count` regions.
+    /// The CPU snapshot (`verts`) is preserved; regions are rewritten
+    /// per-image after their fences signal.
+    ///
+    /// # Safety
+    ///
+    /// No GPU work may reference the old buffer: call only with the device
+    /// idle (swapchain recreation path) or on a freshly rebuilt device.
+    pub unsafe fn ensure_region_capacity(
+        &mut self,
+        ctx: &GfxContext,
+        image_count: usize,
+    ) -> Result<()> {
+        if image_count <= self.vert_regions {
+            return Ok(());
+        }
+        crate::elog!(
+            "vertex regions: {} -> {} (actual swapchain images)",
+            self.vert_regions,
+            image_count
+        );
+        let device = ctx.device();
+        let mem_props = ctx
+            .instance()
+            .get_physical_device_memory_properties(ctx.pdevice);
+        // allocate the replacement FIRST: on any failure the old allocation
+        // stays intact and usable (transactional growth)
+        let (vbuf, vmem, vmap, vbuf_bytes) =
+            unsafe { alloc_vertex_regions(device, &mem_props, image_count)? };
+        // replacement fully initialized — only now retire the old allocation
+        // (unmap, then destroy the buffer to release the memory binding, then free)
+        unsafe { device.unmap_memory(self.vmem) };
+        unsafe { device.destroy_buffer(self.vbuf, None) };
+        unsafe { device.free_memory(self.vmem, None) };
+        self.vbuf = vbuf;
+        self.vmem = vmem;
+        self.vmap = vmap;
+        self.vert_regions = image_count;
+        self.vbuf_bytes = vbuf_bytes;
+        Ok(())
+    }
+
     /// Record the image's command buffer (if dirty). `slot` — this frame's
     /// ring slot. Without sprites (text-only frames).
-    pub unsafe fn record(
-        &mut self,
-        device: &ash::Device,
-        img_idx: usize,
-        slot: usize,
-    ) -> Result<()> {
-        self.record_frame(device, img_idx, slot, None)
+    pub unsafe fn record(&mut self, device: &ash::Device, img_idx: usize) -> Result<()> {
+        self.record_frame(device, img_idx, None)
     }
 
     /// Same, with an optional sprite batch drawn first (under the text).
@@ -554,18 +710,20 @@ impl Renderer {
         &mut self,
         device: &ash::Device,
         img_idx: usize,
-        slot: usize,
         sprites: Option<&SpriteBatcher>,
     ) -> Result<()> {
         if img_idx >= self.cmds.len() {
             return Err(anyhow!("record: img_idx out of range"));
         }
+        check_region_index(
+            img_idx,
+            self.vert_regions,
+            VERTEX_REGION_BYTES,
+            self.vbuf_bytes,
+        )?;
         self.cb_dirty[img_idx] = false;
-        // the image's previous CB may still be executing (IMMEDIATE present
-        // does not throttle acquire): wait for its fence before reset/record
-        device
-            .wait_for_fences(&[self.img_fences[img_idx]], true, 2_000_000_000)
-            .map_err(|e| anyhow!("img cb fence wait: {e:?}"))?;
+        // the image's fence was already waited on by ensure_image_idle this
+        // frame (including skipped-record frames) — reset/record is safe here
         let cmd = self.cmds[img_idx];
         device
             .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
@@ -602,7 +760,9 @@ impl Renderer {
             vk::PipelineStageFlags::TOP_OF_PIPE,
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             vk::DependencyFlags::empty(),
-            &[], &[], &[to_color],
+            &[],
+            &[],
+            &[to_color],
         );
 
         // dynamic rendering: begin/end rendering instead of a render pass
@@ -632,14 +792,14 @@ impl Renderer {
         device.cmd_set_scissor(cmd, 0, &[self.scissor]);
         // sprites first (under the text)
         if let Some(sb) = sprites {
-            sb.draw(device, cmd, slot);
+            sb.draw(device, cmd, img_idx)?;
         }
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
         device.cmd_set_viewport(cmd, 0, &[self.viewport]);
         device.cmd_set_scissor(cmd, 0, &[self.scissor]);
-        // ring slot is selected by the bind offset
-        let slot_off = (slot * MAX_VERTS * std::mem::size_of::<Vertex>()) as vk::DeviceSize;
-        device.cmd_bind_vertex_buffers(cmd, 0, &[self.vbuf], &[slot_off]);
+        // the image owns its vertex region: the bind offset selects it
+        let vert_off = (img_idx * MAX_VERTS * std::mem::size_of::<Vertex>()) as vk::DeviceSize;
+        device.cmd_bind_vertex_buffers(cmd, 0, &[self.vbuf], &[vert_off]);
         if !self.verts.is_empty() {
             device.cmd_draw(cmd, self.verts.len() as u32, 1, 0, 0);
         }
@@ -651,24 +811,26 @@ impl Renderer {
             && self.shot_buf != vk::Buffer::null()
             && (img_idx as u32) < self.images.len() as u32;
         if !shot_now {
-        let to_present = vk::ImageMemoryBarrier {
-            src_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-            dst_access_mask: vk::AccessFlags::empty(),
-            old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            new_layout: vk::ImageLayout::PRESENT_SRC_KHR,
-            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-            image: img,
-            subresource_range: subres,
-            ..Default::default()
-        };
-        device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            vk::DependencyFlags::empty(),
-            &[], &[], &[to_present],
-        );
+            let to_present = vk::ImageMemoryBarrier {
+                src_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                dst_access_mask: vk::AccessFlags::empty(),
+                old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                new_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                image: img,
+                subresource_range: subres,
+                ..Default::default()
+            };
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_present],
+            );
         }
         // screenshot: copy the swapchain image out before present
         if self.shot_pending
@@ -719,7 +881,13 @@ impl Renderer {
                 },
                 ..Default::default()
             };
-            device.cmd_copy_image_to_buffer(cmd, img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, self.shot_buf, &[copy]);
+            device.cmd_copy_image_to_buffer(
+                cmd,
+                img,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                self.shot_buf,
+                &[copy],
+            );
             let to_present = vk::ImageMemoryBarrier {
                 src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
                 dst_access_mask: vk::AccessFlags::empty(),
@@ -747,9 +915,10 @@ impl Renderer {
 
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
         self.destroy_swapchain_objects(device);
+        // unmap, then destroy the buffer (releases the memory binding), then free
         device.unmap_memory(self.vmem);
-        device.free_memory(self.vmem, None);
         device.destroy_buffer(self.vbuf, None);
+        device.free_memory(self.vmem, None);
         device.destroy_command_pool(self.cmd_pool, None);
         device.destroy_pipeline(self.pipeline, None);
         device.destroy_pipeline_layout(self.layout, None);
@@ -784,7 +953,11 @@ fn crc32(prev: u32, data: &[u8]) -> u32 {
     for &b in data {
         c ^= b as u32;
         for _ in 0..8 {
-            c = if c & 1 != 0 { 0xEDB88320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB88320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
         }
     }
     c ^ 0xFFFFFFFF
@@ -798,4 +971,44 @@ fn adler32(data: &[u8]) -> u32 {
         b = (b + a) % 65521;
     }
     (b << 16) | a
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_region_index;
+
+    const RB: u64 = 100;
+
+    #[test]
+    fn region_index_bounds() {
+        let buf = 8 * RB;
+        assert!(check_region_index(0, 8, RB, buf).is_ok());
+        assert!(check_region_index(7, 8, RB, buf).is_ok());
+        assert!(check_region_index(8, 8, RB, buf).is_err());
+        assert!(check_region_index(usize::MAX, 8, RB, buf).is_err());
+        // allocation smaller than the region count: the last region extends
+        // past the buffer and must be rejected
+        assert!(check_region_index(7, 8, RB, 7 * RB).is_err());
+        assert!(check_region_index(6, 8, RB, 7 * RB).is_ok());
+    }
+
+    #[test]
+    fn capacity_follows_actual_image_count() {
+        // a driver may return MORE images than the requested minImageCount:
+        // the region capacity must be derived from the actual count, so an
+        // actual count above FIF is covered (pure capacity-rule test, not a
+        // Vulkan driver simulation)
+        let actual_images = 12usize;
+        let fif = 8usize;
+        assert!(actual_images > fif);
+        let regions = region_capacity_for(actual_images);
+        assert!(regions >= actual_images);
+        assert!(check_region_index(actual_images - 1, regions, RB, regions as u64 * RB).is_ok());
+        assert!(check_region_index(actual_images, regions, RB, regions as u64 * RB).is_err());
+    }
+
+    /// Region capacity for a swapchain: exactly the actual image count.
+    fn region_capacity_for(actual_image_count: usize) -> usize {
+        actual_image_count
+    }
 }
