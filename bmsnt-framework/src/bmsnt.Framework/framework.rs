@@ -9,7 +9,7 @@
 
 #[path = "Graphics/graphics.rs"]
 pub mod graphics;
-#[path = "Input/input_core.rs"]
+#[path = "Input/mod.rs"]
 pub mod input;
 #[path = "Logging/logging.rs"]
 pub mod logging;

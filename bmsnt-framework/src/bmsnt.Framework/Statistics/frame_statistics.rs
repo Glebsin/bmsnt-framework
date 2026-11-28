@@ -16,7 +16,7 @@ pub struct FrameStats {
     pub t_events: u128,
     /// ui::draw (text + panels geometry)
     pub t_ui: u128,
-    /// test scene draw (SpriteBatch stress etc.)
+    /// test scene draw 
     pub t_scene: u128,
     pub acq_calls: u32,
     pub acq_retries: u32,
