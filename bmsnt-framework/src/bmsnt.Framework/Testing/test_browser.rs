@@ -21,9 +21,10 @@ use crate::statistics::{FrameStats, WARMUP_MS};
 use crate::text::MAX_VERTS;
 
 use crate::testing::design_palette::{DESIGN_H, DESIGN_W};
-use crate::testing::test_browser_ui as ui;
-use crate::testing::test_browser_ui::{Layout, UiState};
-use crate::testing::test_scenes::{KeysScreen, SpriteBatchScreen, TestCase};
+use crate::testing::scenes::{KeysScreen, SpriteBatchScreen};
+use crate::testing::test_scene::TestCase;
+use crate::testing::ui as ui;
+use crate::testing::ui::{Layout, UiState};
 
 const STATS_WINDOW_MS: u64 = 250;
 
