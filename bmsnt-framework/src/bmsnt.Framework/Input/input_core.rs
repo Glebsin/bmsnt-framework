@@ -397,6 +397,20 @@ impl InputCore {
     pub fn key_pressed(&self, sc: SDL_Scancode) -> bool {
         self.keyboard.keys[(sc.0 as usize) % SCANCODE_COUNT].pressed
     }
+    /// Scancodes currently held, ordered by press time (oldest first).
+    /// Timestamps are the SDL event ns of the latest edge per key.
+    pub fn held_keys(&self) -> Vec<(u64, SDL_Scancode)> {
+        let mut v: Vec<(u64, SDL_Scancode)> = self
+            .keyboard
+            .keys
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.down)
+            .map(|(i, b)| (b.ts_ns, SDL_Scancode(i as i32)))
+            .collect();
+        v.sort_by_key(|(ts, _)| *ts);
+        v
+    }
     pub fn mouse_pos(&self) -> (f32, f32) {
         (self.mouse.x, self.mouse.y)
     }

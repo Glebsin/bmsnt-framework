@@ -4,7 +4,7 @@ fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
 
     // compile both shaders: the text/quad pipeline and the sprite batcher
-    for (src, out) in [("src/shader.wgsl", "shader.spv"), ("src/sprite.wgsl", "sprite.spv")] {
+    for (src, out) in [("src/bmsnt.Framework/Graphics/text_quad.wgsl", "shader.spv"), ("src/bmsnt.Framework/Graphics/sprite_batch.wgsl", "sprite.spv")] {
         let src_text = fs::read_to_string(src).unwrap_or_else(|_| panic!("read {src}"));
         let module = naga::front::wgsl::parse_str(&src_text).unwrap_or_else(|e| panic!("parse {src}: {e:?}"));
         let mut validator = naga::valid::Validator::new(

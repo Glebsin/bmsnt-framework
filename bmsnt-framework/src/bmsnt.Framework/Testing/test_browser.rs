@@ -10,19 +10,20 @@ use std::time::Instant;
 
 use ash::vk;
 
-use bmsnt_framework::core::time::{FrameStats, WARMUP_MS};
-use bmsnt_framework::gfx::device::GfxContext;
-use bmsnt_framework::gfx::frames::FramesInFlight;
-use bmsnt_framework::gfx::renderer::Renderer;
-use bmsnt_framework::gfx::sprite::SpriteBatcher;
-use bmsnt_framework::gfx::swapchain::{Acquire, Swapchain};
-use bmsnt_framework::input::{Binding, InputCore};
-use bmsnt_framework::platform::window::Window;
-use bmsnt_framework::ui::text::MAX_VERTS;
+use crate::graphics::sprites::SpriteBatcher;
+use crate::graphics::vulkan::device::GfxContext;
+use crate::graphics::vulkan::frame_sync::FramesInFlight;
+use crate::graphics::vulkan::renderer::Renderer;
+use crate::graphics::vulkan::swapchain::{Acquire, Swapchain};
+use crate::input::{Binding, InputCore};
+use crate::platform::window::Window;
+use crate::statistics::{FrameStats, WARMUP_MS};
+use crate::text::MAX_VERTS;
 
-use crate::screens::{SpriteBatchScreen, TestCase};
-use crate::theme::{DESIGN_H, DESIGN_W};
-use crate::ui::{self, Layout, UiState};
+use crate::testing::design_palette::{DESIGN_H, DESIGN_W};
+use crate::testing::test_browser_ui as ui;
+use crate::testing::test_browser_ui::{Layout, UiState};
+use crate::testing::test_scenes::{KeysScreen, SpriteBatchScreen, TestCase};
 
 const STATS_WINDOW_MS: u64 = 250;
 
@@ -49,19 +50,19 @@ type UiSig = (
 pub unsafe fn run() -> Result<()> {
     // lock the GPU clock to the driver max, same as vk5d (needs admin;
     // failure is logged and non-fatal; reset on exit via Drop)
-    let nvml = match bmsnt_framework::core::nvml::Nvml::init_and_lock_max() {
+    let nvml = match crate::platform::nvml::Nvml::init_and_lock_max() {
         Ok(n) => {
-            bmsnt_framework::elog!("GPU: {} | clock locked at {} MHz", n.gpu_name, n.locked_mhz);
+            crate::elog!("GPU: {} | clock locked at {} MHz", n.gpu_name, n.locked_mhz);
             Some(n)
         }
         Err(e) => {
-            bmsnt_framework::elog!("NVML clock lock unavailable: {e}");
+            crate::elog!("NVML clock lock unavailable: {e}");
             None
         }
     };
     let result = Game::new()?.run();
     drop(nvml); // reset clocks on exit
-    bmsnt_framework::elog!("exit: run complete");
+    crate::elog!("exit: run complete");
     result
 }
 
@@ -72,8 +73,8 @@ struct Game {
     sprites: SpriteBatcher,
     frames: FramesInFlight,
     input: InputCore,
-    act_quit: bmsnt_framework::input::ActionId,
-    act_shot: bmsnt_framework::input::ActionId,
+    act_quit: crate::input::ActionId,
+    act_shot: crate::input::ActionId,
     ui: UiState,
     screens: Vec<Box<dyn TestCase>>,
     stats: FrameStats,
@@ -83,14 +84,17 @@ struct Game {
     last_sig: Option<UiSig>,
     /// BMSNT_NOSPRITES read once at init (not per frame)
     no_sprites: bool,
-    /// static display names of the tests (no per-frame allocation)
-    screen_names: Vec<&'static str>,
+    /// static (display name, folder) of the tests (sidebar grouping)
+    screen_items: Vec<(&'static str, &'static str)>,
+    /// scratch buffer: static UI text + dynamic scene text, uploaded as one
+    /// text-vertex layer
+    text_scratch: Vec<crate::text::Vertex>,
     /// cached UI layer: instances after ui::draw and text verts (reused while
     /// a scene runs — the UI does not change frame to frame)
     ui_snap: Vec<f32>,
     /// true while a swapchain recreation is deferred (drawable is 0x0)
     recreate_deferred: bool,
-    ui_verts: Vec<bmsnt_framework::ui::text::Vertex>,
+    ui_verts: Vec<crate::text::Vertex>,
     /// last field: must be dropped AFTER ctx (the surface holds the hwnd)
     window: Window,
 }
@@ -104,7 +108,7 @@ impl Game {
         let mut renderer = Renderer::new(&ctx, swapchain.image_count())?;
         renderer.create_swapchain_objects(&ctx, &swapchain)?;
         let sprites = SpriteBatcher::new(&ctx, swapchain.image_count())?;
-        bmsnt_framework::elog!(
+        crate::elog!(
             "mapped regions: vertex={} instance={} (actual images={})",
             renderer.vertex_region_capacity(),
             sprites.instance_region_capacity(),
@@ -112,7 +116,7 @@ impl Game {
         );
         let frames = FramesInFlight::new(
             ctx.device(),
-            bmsnt_framework::gfx::frames::frames_in_flight(),
+            crate::graphics::vulkan::frame_sync::frames_in_flight(),
         );
 
         let mut input = InputCore::new();
@@ -128,10 +132,14 @@ impl Game {
             &[Binding::Key(sdl3_sys::everything::SDL_Scancode::F12)],
         );
 
-        let screens: Vec<Box<dyn TestCase>> = vec![Box::new(SpriteBatchScreen::new())];
-        let screen_names: Vec<&'static str> = screens.iter().map(|t| t.name()).collect();
+        let screens: Vec<Box<dyn TestCase>> = vec![
+            Box::new(SpriteBatchScreen::new()),
+            Box::new(KeysScreen::new()),
+        ];
+        let screen_items: Vec<(&'static str, &'static str)> =
+            screens.iter().map(|t| (t.name(), t.folder())).collect();
 
-        bmsnt_framework::elog!(
+        crate::elog!(
             "bmsnt_test_browser swapchain: {}x{} images={} present_mode={:?}",
             swapchain.extent.width,
             swapchain.extent.height,
@@ -155,7 +163,8 @@ impl Game {
             t_start: Instant::now(),
             last_sig: None,
             no_sprites: std::env::var("BMSNT_NOSPRITES").is_ok(),
-            screen_names,
+            screen_items,
+            text_scratch: Vec::new(),
             ui_snap: Vec::new(),
             ui_verts: Vec::new(),
             recreate_deferred: false,
@@ -223,7 +232,7 @@ impl Game {
             }
             self.stats.t_wait += t0.elapsed().as_nanos();
             if !fence_ok {
-                bmsnt_framework::elog!("frame fence did not signal in 1 s — full rebuild");
+                crate::elog!("frame fence did not signal in 1 s — full rebuild");
                 self.full_rebuild()?;
                 continue 'main;
             }
@@ -279,7 +288,7 @@ impl Game {
                     &mut self.sprites,
                     &layout,
                     &self.ui,
-                    &self.screen_names,
+                    &self.screen_items,
                     mx,
                     my,
                     (w, h),
@@ -319,9 +328,35 @@ impl Game {
                 if let Some(i) = scene_idx {
                     let screen = self.screens[i].as_mut();
                     let t = self.t_start.elapsed().as_secs_f32();
+                    let mut scene_text = Vec::new();
                     let t_sc0 = Instant::now();
-                    screen.draw(&mut self.sprites, layout.game, s, (w, h), t)?;
+                    screen.draw(
+                        &mut self.sprites,
+                        layout.game,
+                        s,
+                        (w, h),
+                        t,
+                        &self.input,
+                        &mut scene_text,
+                    )?;
                     self.stats.t_scene += t_sc0.elapsed().as_nanos();
+                    // dynamic scene text joins the static UI text as one
+                    // layer; uploaded per frame (write_image_verts below
+                    // writes each image's region after its fence)
+                    if !scene_text.is_empty() {
+                        let mut combined = std::mem::take(&mut self.text_scratch);
+                        combined.clear();
+                        combined.extend_from_slice(&self.ui_verts);
+                        combined.extend_from_slice(&scene_text);
+                        if combined.len() > MAX_VERTS {
+                            return Err(anyhow!(
+                                "scene frame too long: {} text verts",
+                                combined.len()
+                            ));
+                        }
+                        self.renderer.upload_verts(&combined);
+                        self.text_scratch = combined;
+                    }
                 }
                 // per-frame scene data: the composed list is written to the
                 // acquired image's region below (after its fence wait), and
@@ -368,7 +403,7 @@ impl Game {
                 let path = screenshot_path()?;
                 let path_str = path.to_string_lossy().into_owned();
                 self.renderer.write_png(&path_str)?;
-                bmsnt_framework::elog!("screenshot saved: {}", path.display());
+                crate::elog!("screenshot saved: {}", path.display());
             }
 
             self.frames.advance();
@@ -409,25 +444,25 @@ impl Game {
 
         // --- teardown ---
         // tolerant: the device may have been lost during the session
-        bmsnt_framework::elog!("teardown: idle");
+        crate::elog!("teardown: idle");
         let _ = self.ctx.device().device_wait_idle();
-        bmsnt_framework::elog!("teardown: on_idle");
+        crate::elog!("teardown: on_idle");
         self.frames.on_idle();
-        bmsnt_framework::elog!("teardown: renderer");
+        crate::elog!("teardown: renderer");
         self.renderer.destroy(self.ctx.device());
-        bmsnt_framework::elog!("teardown: sprites");
+        crate::elog!("teardown: sprites");
         self.sprites.destroy(self.ctx.device());
-        bmsnt_framework::elog!("teardown: frames");
+        crate::elog!("teardown: frames");
         self.frames.destroy(self.ctx.device());
-        bmsnt_framework::elog!("teardown: swapchain");
+        crate::elog!("teardown: swapchain");
         self.swapchain.destroy(self.ctx.device());
-        bmsnt_framework::elog!("teardown: input");
+        crate::elog!("teardown: input");
         self.input.close();
-        bmsnt_framework::elog!("teardown: ctx");
+        crate::elog!("teardown: ctx");
         self.ctx.destroy();
-        bmsnt_framework::elog!("teardown: window");
+        crate::elog!("teardown: window");
         self.window.destroy();
-        bmsnt_framework::elog!("teardown: done");
+        crate::elog!("teardown: done");
         Ok(())
     }
 
@@ -460,7 +495,7 @@ impl Game {
                 Acquire::NotReady => {
                     self.stats.acq_retries += 1;
                     if Instant::now() > deadline {
-                        bmsnt_framework::elog!(
+                        crate::elog!(
                             "acquire: no image for 100 ms ({} retries) — recreating",
                             self.stats.acq_retries
                         );
@@ -475,7 +510,7 @@ impl Game {
                 }
                 Acquire::DeviceLost => {
                     self.stats.t_acq += t0.elapsed().as_nanos();
-                    bmsnt_framework::elog!("acquire: device lost (fullscreen switch) — recreating");
+                    crate::elog!("acquire: device lost (fullscreen switch) — recreating");
                     *need_recreate = true;
                     break;
                 }
@@ -498,8 +533,12 @@ impl Game {
             self.ui.expanded = !self.ui.expanded;
             handled = true;
         } else if self.ui.expanded {
-            if let Some(i) = (0..self.screens.len()).find(|&i| layout.row(i).hit(mx, my)) {
-                self.ui.selected_test = Some(i);
+            if let Some(t) = ui::list_rows(&self.screen_items)
+                .iter()
+                .find(|r| r.test.is_some() && r.rect.hit(mx, my))
+                .and_then(|r| r.test)
+            {
+                self.ui.selected_test = Some(t);
                 handled = true;
             }
         }
@@ -550,8 +589,8 @@ impl Game {
             // switches. Try the cheap path (swapchain recreation) first;
             // if vkDeviceWaitIdle also reports lost, recreate() escalates to
             // a full device-level rebuild.
-            bmsnt_framework::elog!("submit: device lost (fullscreen switch) — recreating");
-            bmsnt_framework::elog!("submit: on_idle");
+            crate::elog!("submit: device lost (fullscreen switch) — recreating");
+            crate::elog!("submit: on_idle");
             self.frames.on_idle(); // mark fences "logically signaled" before rebuild
             *need_recreate = true;
             return Ok(());
@@ -570,7 +609,7 @@ impl Game {
         if let Err(vk::Result::ERROR_OUT_OF_DATE_KHR) = present_result {
             *need_recreate = true;
         } else if let Err(vk::Result::ERROR_DEVICE_LOST) = present_result {
-            bmsnt_framework::elog!("present: device lost (fullscreen switch) — recreating");
+            crate::elog!("present: device lost (fullscreen switch) — recreating");
             *need_recreate = true;
         } else if let Err(e) = present_result {
             return Err(anyhow!("present: {e:?}"));
@@ -595,13 +634,13 @@ impl Game {
             Ok(None) => {
                 if !self.recreate_deferred {
                     self.recreate_deferred = true;
-                    bmsnt_framework::elog!("recreation deferred: drawable extent is 0x0");
+                    crate::elog!("recreation deferred: drawable extent is 0x0");
                 }
                 return Ok(());
             }
             // a real Vulkan error must not be masked as "0x0 minimized"
             Err(e) => {
-                bmsnt_framework::elog!("surface query failed: {e:#} — full rebuild");
+                crate::elog!("surface query failed: {e:#} — full rebuild");
                 return self.full_rebuild();
             }
             Ok(Some(_)) => {}
@@ -611,12 +650,12 @@ impl Game {
             return self.full_rebuild();
         }
         // after a fullscreen switch the device may report lost — do not fail here
-        bmsnt_framework::elog!("rebuild: idle");
+        crate::elog!("rebuild: idle");
         let _ = self.ctx.device().device_wait_idle();
-        bmsnt_framework::elog!("rebuild: on_idle");
+        crate::elog!("rebuild: on_idle");
         self.frames.on_idle();
         self.renderer.destroy_swapchain_objects(self.ctx.device());
-        bmsnt_framework::elog!("rebuild: swapchain");
+        crate::elog!("rebuild: swapchain");
         self.swapchain.destroy(self.ctx.device());
         self.swapchain = Swapchain::new(&self.ctx)?;
         // capacity follows the ACTUAL returned image count; the device is
@@ -627,7 +666,7 @@ impl Game {
             .ensure_region_capacity(&self.ctx, self.swapchain.image_count())?;
         self.renderer
             .create_swapchain_objects(&self.ctx, &self.swapchain)?;
-        bmsnt_framework::elog!(
+        crate::elog!(
             "swapchain recreated: {}x{}",
             self.swapchain.extent.width,
             self.swapchain.extent.height
@@ -640,21 +679,21 @@ impl Game {
     /// Retries briefly — the lost state during a fullscreen switch can take
     /// a moment to clear.
     unsafe fn full_rebuild(&mut self) -> Result<()> {
-        bmsnt_framework::elog!("device lost — full rebuild");
+        crate::elog!("device lost — full rebuild");
         // best-effort destruction on a lost device
-        bmsnt_framework::elog!("rebuild: renderer");
+        crate::elog!("rebuild: renderer");
         self.renderer.destroy(self.ctx.device());
-        bmsnt_framework::elog!("rebuild: sprites");
+        crate::elog!("rebuild: sprites");
         self.sprites.destroy(self.ctx.device());
-        bmsnt_framework::elog!("rebuild: frames");
+        crate::elog!("rebuild: frames");
         self.frames.destroy(self.ctx.device());
-        bmsnt_framework::elog!("rebuild: swapchain");
+        crate::elog!("rebuild: swapchain");
         self.swapchain.destroy(self.ctx.device());
         for attempt in 1..=10u32 {
             match self.rebuild_device_stack() {
                 Ok(()) => return Ok(()),
                 Err(e) if attempt < 10 => {
-                    bmsnt_framework::elog!("rebuild attempt {attempt} failed: {e:#}; retrying");
+                    crate::elog!("rebuild attempt {attempt} failed: {e:#}; retrying");
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 Err(e) => return Err(e),
@@ -664,19 +703,21 @@ impl Game {
     }
 
     unsafe fn rebuild_device_stack(&mut self) -> Result<()> {
-        bmsnt_framework::elog!("rebuild_stack: device");
+        crate::elog!("rebuild_stack: device");
         self.ctx.recreate_device()?;
-        bmsnt_framework::elog!("rebuild_stack: frames");
+        crate::elog!("rebuild_stack: frames");
         self.frames = FramesInFlight::new(
             self.ctx.device(),
-            bmsnt_framework::gfx::frames::frames_in_flight(),
+            crate::graphics::vulkan::frame_sync::frames_in_flight(),
         );
-        bmsnt_framework::elog!("rebuild_stack: sprites");
-        self.sprites =
-            SpriteBatcher::new(&self.ctx, bmsnt_framework::gfx::frames::frames_in_flight())?;
-        bmsnt_framework::elog!("rebuild_stack: swapchain");
+        crate::elog!("rebuild_stack: sprites");
+        self.sprites = SpriteBatcher::new(
+            &self.ctx,
+            crate::graphics::vulkan::frame_sync::frames_in_flight(),
+        )?;
+        crate::elog!("rebuild_stack: swapchain");
         self.swapchain = Swapchain::new(&self.ctx)?;
-        bmsnt_framework::elog!("rebuild_stack: renderer");
+        crate::elog!("rebuild_stack: renderer");
         self.renderer = Renderer::new(&self.ctx, self.swapchain.image_count())?;
         // capacity follows the actual image count (the FIF-sized start guess
         // may need to grow); device is fresh — no pending work on old buffers
@@ -684,7 +725,7 @@ impl Game {
             .ensure_region_capacity(&self.ctx, self.swapchain.image_count())?;
         self.renderer
             .ensure_region_capacity(&self.ctx, self.swapchain.image_count())?;
-        bmsnt_framework::elog!("rebuild_stack: sc objects");
+        crate::elog!("rebuild_stack: sc objects");
         self.renderer
             .create_swapchain_objects(&self.ctx, &self.swapchain)?;
         Ok(())

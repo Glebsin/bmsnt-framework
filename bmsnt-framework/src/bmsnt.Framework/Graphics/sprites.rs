@@ -13,8 +13,8 @@ use std::ptr;
 
 use ash::vk;
 
-use super::device::GfxContext;
-use super::renderer::check_region_index;
+use super::vulkan::device::GfxContext;
+use super::vulkan::renderer::check_region_index;
 
 /// per-frame instance limit
 pub const MAX_INSTANCES: usize = 4096;

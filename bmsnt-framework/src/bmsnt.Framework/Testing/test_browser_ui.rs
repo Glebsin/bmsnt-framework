@@ -2,27 +2,11 @@
 //! `draw` of all panels, buttons and text — the osu-framework drawable layer
 //! rendered by the sprite batcher. Layout lives in design space (`theme`).
 
-use bmsnt_framework::gfx::sprite::SpriteBatcher;
-use bmsnt_framework::ui::text::{build_text, Vertex};
+use crate::graphics::primitives::Rect;
+use crate::graphics::sprites::SpriteBatcher;
+use crate::text::{build_text, Vertex};
 
-use crate::theme::*;
-
-/// Axis-aligned rect in design space; the primitive of every UI element.
-pub struct Rect {
-    pub x: f32,
-    pub y: f32,
-    pub w: f32,
-    pub h: f32,
-}
-
-impl Rect {
-    pub fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
-        Self { x, y, w, h }
-    }
-    pub fn hit(&self, mx: f32, my: f32) -> bool {
-        mx >= self.x && mx <= self.x + self.w && my >= self.y && my <= self.y + self.h
-    }
-}
+use crate::testing::design_palette::*;
 
 /// Mutable UI state (selection, running test, list expanded).
 pub struct UiState {
@@ -87,28 +71,55 @@ impl Layout {
             ),
         }
     }
+}
 
-    /// Rect of test row `i` in the (collapsible) sidebar list.
-    pub fn row(&self, i: usize) -> Rect {
-        Rect::new(
-            16.0,
-            TOP_BAR_H + 10.0 + ROW_H + 4.0 + i as f32 * ROW_H,
-            SIDEBAR_W - 32.0,
-            ROW_H,
-        )
+/// One display row of the sidebar list: a folder header or a test row.
+pub struct ListRow {
+    pub rect: Rect,
+    /// Some(label) — folder header row; None — test row
+    pub folder: Option<&'static str>,
+    /// test index for test rows
+    pub test: Option<usize>,
+}
+
+/// Sidebar display rows: a folder header is inserted before the first test
+/// of each folder, in first-appearance order. `items` — (test name, folder)
+/// in registration order.
+pub fn list_rows(items: &[(&'static str, &'static str)]) -> Vec<ListRow> {
+    let mut rows = Vec::new();
+    let mut seen: Vec<&'static str> = Vec::new();
+    let mut y = TOP_BAR_H + 10.0 + ROW_H + 4.0;
+    for (i, &(_, folder)) in items.iter().enumerate() {
+        if !seen.contains(&folder) {
+            seen.push(folder);
+            rows.push(ListRow {
+                rect: Rect::new(16.0, y, SIDEBAR_W - 32.0, ROW_H),
+                folder: Some(folder),
+                test: None,
+            });
+            y += ROW_H;
+        }
+        rows.push(ListRow {
+            rect: Rect::new(16.0, y, SIDEBAR_W - 32.0, ROW_H),
+            folder: None,
+            test: Some(i),
+        });
+        y += ROW_H;
     }
+    rows
 }
 
 /// Draw the whole UI: background, panels, buttons and text. `mx`/`my` are
 /// mouse coords in design space, `res` the framebuffer size, `status` the
 /// top-bar status line ("FPS .. FLIP .."), `scene_running` whether a test
 /// scene is active (drives the game-view caption and RUN/STOP colors),
-/// `names` — display names of the tests (sidebar rows).
+/// `items` — (display name, folder) of the tests (sidebar rows grouped by
+/// folder).
 pub fn draw(
     sprites: &mut SpriteBatcher,
     layout: &Layout,
     ui: &UiState,
-    names: &[&str],
+    items: &[(&'static str, &'static str)],
     mx: f32,
     my: f32,
     res: (f32, f32),
@@ -116,10 +127,19 @@ pub fn draw(
     scene_running: bool,
 ) -> Vec<Vertex> {
     let mut verts = Vec::new();
+    let rows = list_rows(items);
 
     // --- sprites: background, panels, rows ---
     sprites.begin_section(0.0, 0.0, res.0, res.1);
-    sprites.gradient(0.0, 0.0, DESIGN_W, DESIGN_H, COL_GRAD_TOP, COL_GRAD_BOTTOM, res);
+    sprites.gradient(
+        0.0,
+        0.0,
+        DESIGN_W,
+        DESIGN_H,
+        COL_GRAD_TOP,
+        COL_GRAD_BOTTOM,
+        res,
+    );
 
     // top bar + screenshot button
     sprites.solid(0.0, 0.0, DESIGN_W, TOP_BAR_H, COL_TOP_BAR, res);
@@ -134,8 +154,22 @@ pub fn draw(
     );
 
     // left panel (test list) + separator
-    sprites.solid(0.0, TOP_BAR_H, SIDEBAR_W, DESIGN_H - TOP_BAR_H, COL_SIDEBAR, res);
-    sprites.solid(SIDEBAR_W, TOP_BAR_H, 1.0, DESIGN_H - TOP_BAR_H, COL_BORDER, res);
+    sprites.solid(
+        0.0,
+        TOP_BAR_H,
+        SIDEBAR_W,
+        DESIGN_H - TOP_BAR_H,
+        COL_SIDEBAR,
+        res,
+    );
+    sprites.solid(
+        SIDEBAR_W,
+        TOP_BAR_H,
+        1.0,
+        DESIGN_H - TOP_BAR_H,
+        COL_BORDER,
+        res,
+    );
 
     // collapsible header item
     let header_hover = layout.header.hit(mx, my);
@@ -144,34 +178,50 @@ pub fn draw(
         layout.header.y,
         layout.header.w,
         layout.header.h,
-        if header_hover { COL_ROW_HOVER } else { COL_ROW_SEL },
+        if header_hover {
+            COL_ROW_HOVER
+        } else {
+            COL_ROW_SEL
+        },
         res,
     );
 
-    // expanded list of test cases
+    // expanded list: folder headers + test rows
     if ui.expanded {
-        for i in 0..names.len() {
-            let r = layout.row(i);
-            let sel = ui.selected_test == Some(i);
-            let hovered = r.hit(mx, my);
-            if sel || hovered {
-                sprites.solid(
-                    r.x,
-                    r.y,
-                    r.w,
-                    r.h,
-                    if sel { COL_ROW_SEL } else { COL_ROW_HOVER },
-                    res,
-                );
-            }
-            if sel {
-                sprites.solid(r.x, r.y, 3.0, r.h, COL_ACCENT, res);
+        for row in &rows {
+            if let Some(_folder) = row.folder {
+                // folder header: thin accent line on top of the row
+                sprites.solid(row.rect.x, row.rect.y, row.rect.w, 1.0, COL_BORDER, res);
+            } else {
+                let r = &row.rect;
+                let sel = ui.selected_test == row.test;
+                let hovered = r.hit(mx, my);
+                if sel || hovered {
+                    sprites.solid(
+                        r.x,
+                        r.y,
+                        r.w,
+                        r.h,
+                        if sel { COL_ROW_SEL } else { COL_ROW_HOVER },
+                        res,
+                    );
+                }
+                if sel {
+                    sprites.solid(r.x, r.y, 3.0, r.h, COL_ACCENT, res);
+                }
             }
         }
     }
 
     // actions panel (no separator on the right: the game view starts flush)
-    sprites.solid(SIDEBAR_W, TOP_BAR_H, ACTIONS_W, DESIGN_H - TOP_BAR_H, COL_ACTIONS, res);
+    sprites.solid(
+        SIDEBAR_W,
+        TOP_BAR_H,
+        ACTIONS_W,
+        DESIGN_H - TOP_BAR_H,
+        COL_ACTIONS,
+        res,
+    );
 
     // action buttons (real actions of the selected test)
     if ui.selected_test.is_some() {
@@ -212,7 +262,15 @@ pub fn draw(
     sprites.solid(g.x, g.y, g.w, g.h, COL_GAME_BG, res);
 
     // --- text ---
-    verts.extend(build_text("TEST BROWSER", 20.0, 16.0, 2.0, res.0, res.1, COL_TEXT));
+    verts.extend(build_text(
+        "TEST BROWSER",
+        20.0,
+        16.0,
+        2.0,
+        res.0,
+        res.1,
+        COL_TEXT,
+    ));
     verts.extend(build_text(
         "SCREENSHOT",
         layout.shot_btn.x + (layout.shot_btn.w - "SCREENSHOT".len() as f32 * 12.0) / 2.0,
@@ -235,7 +293,7 @@ pub fn draw(
 
     // sidebar: header + test list
     verts.extend(build_text(
-        "GRAPHIC TESTS",
+        "TESTS",
         layout.header.x + 12.0,
         layout.header.y + 11.0,
         2.0,
@@ -253,18 +311,31 @@ pub fn draw(
         COL_TEXT_DIM,
     ));
     if ui.expanded {
-        for (i, name) in names.iter().enumerate() {
-            let r = layout.row(i);
-            let sel = ui.selected_test == Some(i);
-            verts.extend(build_text(
-                name,
-                r.x + 14.0,
-                r.y + 11.0,
-                2.0,
-                res.0,
-                res.1,
-                if sel { COL_TEXT } else { COL_TEXT_DIM },
-            ));
+        for row in &rows {
+            let r = &row.rect;
+            if let Some(folder) = row.folder {
+                verts.extend(build_text(
+                    folder,
+                    r.x + 14.0,
+                    r.y + 11.0,
+                    2.0,
+                    res.0,
+                    res.1,
+                    COL_ACCENT,
+                ));
+            } else {
+                let i = row.test.unwrap_or(0);
+                let sel = ui.selected_test == row.test;
+                verts.extend(build_text(
+                    items[i].0,
+                    r.x + 14.0,
+                    r.y + 11.0,
+                    2.0,
+                    res.0,
+                    res.1,
+                    if sel { COL_TEXT } else { COL_TEXT_DIM },
+                ));
+            }
         }
     }
 
@@ -278,9 +349,9 @@ pub fn draw(
         res.1,
         COL_TEXT_DIM,
     ));
-    if let Some(test) = ui.selected_test.filter(|&i| i < names.len()) {
+    if let Some(test) = ui.selected_test.filter(|&i| i < items.len()) {
         verts.extend(build_text(
-            names[test],
+            items[test].0,
             SIDEBAR_W + 16.0,
             TOP_BAR_H + 44.0,
             2.0,
@@ -325,7 +396,15 @@ pub fn draw(
         layout.game.h as u32,
         if scene_running { "RUNNING" } else { "IDLE" }
     );
-    verts.extend(build_text(&cap, g.x + 8.0, g.y + 8.0, 2.0, res.0, res.1, COL_TEXT_DIM));
+    verts.extend(build_text(
+        &cap,
+        g.x + 8.0,
+        g.y + 8.0,
+        2.0,
+        res.0,
+        res.1,
+        COL_TEXT_DIM,
+    ));
 
     verts
 }

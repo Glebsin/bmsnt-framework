@@ -13,12 +13,12 @@ use std::ptr;
 use ash::vk;
 
 use super::device::GfxContext;
-use super::sprite::SpriteBatcher;
 use super::swapchain::Swapchain;
-use crate::ui::text::Vertex;
+use crate::graphics::sprites::SpriteBatcher;
+use crate::text::Vertex;
 
 /// per-slot vertex limit — shares the source of truth with ui::text
-pub const MAX_VERTS: usize = crate::ui::text::MAX_VERTS;
+pub const MAX_VERTS: usize = crate::text::MAX_VERTS;
 
 pub struct Renderer {
     cmd_pool: vk::CommandPool,

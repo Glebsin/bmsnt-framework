@@ -50,7 +50,10 @@ impl GfxContext {
         // BMSNT_VALIDATE=1 (or bmsnt-framework) enables the Khronos validation layer
         // + debug utils; violations are logged via elog
         let validate = std::env::var("VALIDATE").is_ok();
-        let mut debug_messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)> = None;
+        let mut debug_messenger: Option<(
+            ash::ext::debug_utils::Instance,
+            vk::DebugUtilsMessengerEXT,
+        )> = None;
         let mut layers: Vec<*const i8> = Vec::new();
         // VK_EXT_debug_utils may only be enabled (and its functions called)
         // when the extension was actually requested for the instance
@@ -109,7 +112,7 @@ impl GfxContext {
                     | vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
                     | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
                 pfn_user_callback: Some(debug_callback),
-                p_user_data: name as *const c_void as *mut _ ,
+                p_user_data: name as *const c_void as *mut _,
                 ..Default::default()
             };
             let messenger = unsafe { dbg.create_debug_utils_messenger(&info, None) }
@@ -118,8 +121,7 @@ impl GfxContext {
         }
 
         // --- surface ---
-        let hinstance =
-            windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(ptr::null());
+        let hinstance = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(ptr::null());
         if hinstance.is_null() {
             return Err(anyhow!("GetModuleHandleW = null"));
         }
@@ -167,7 +169,9 @@ impl GfxContext {
                     let mut ok = 0u32;
                     let r = (surface_instance
                         .fp()
-                        .get_physical_device_surface_support_khr)(*pd, idx as u32, surface, &mut ok);
+                        .get_physical_device_surface_support_khr)(
+                        *pd, idx as u32, surface, &mut ok,
+                    );
                     r == vk::Result::SUCCESS && ok == 1
                 };
                 if graphics && present {
@@ -183,7 +187,8 @@ impl GfxContext {
                 break;
             }
         }
-        let (pdevice, qfi) = chosen.ok_or_else(|| anyhow!("no device with graphics+present queue"))?;
+        let (pdevice, qfi) =
+            chosen.ok_or_else(|| anyhow!("no device with graphics+present queue"))?;
 
         let queue_priorities = [1.0f32];
         let queue_info = vk::DeviceQueueCreateInfo {

@@ -88,11 +88,7 @@ impl FrameStats {
         const FLIP_LOST_AFTER: u32 = 3;
         const FLIP_OK_AFTER: u32 = 3;
         const COMPOSITION_FPS_CEILING: i64 = 4500;
-        if self.t_present > 0
-            && present_us < 80.0
-            && fps > 1000
-            && fps < COMPOSITION_FPS_CEILING
-        {
+        if self.t_present > 0 && present_us < 80.0 && fps > 1000 && fps < COMPOSITION_FPS_CEILING {
             self.flip_below_streak += 1;
             self.flip_above_streak = 0;
             if self.flip_below_streak >= FLIP_LOST_AFTER {
