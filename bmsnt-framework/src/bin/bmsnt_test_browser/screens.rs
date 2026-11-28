@@ -84,7 +84,7 @@ impl SpriteBatchScreen {
 
 impl TestCase for SpriteBatchScreen {
     fn name(&self) -> &'static str {
-        "SpriteBatch"
+        "Sprites"
     }
 
     fn draw(

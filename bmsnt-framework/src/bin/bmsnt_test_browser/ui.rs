@@ -235,7 +235,7 @@ pub fn draw(
 
     // sidebar: header + test list
     verts.extend(build_text(
-        "TEST CASES",
+        "GRAPHIC TESTS",
         layout.header.x + 12.0,
         layout.header.y + 11.0,
         2.0,
