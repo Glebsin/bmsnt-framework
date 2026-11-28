@@ -8,7 +8,6 @@ use crate::testing::design_palette::*;
 
 /// One-frame layout of all UI rects (pure design space, no scaling here).
 pub struct Layout {
-    pub header: Rect,
     pub shot_btn: Rect,
     pub run_btn: Rect,
     pub stop_btn: Rect,
@@ -31,7 +30,6 @@ impl Layout {
             gw = gh * 16.0 / 9.0;
         }
         Self {
-            header: Rect::new(8.0, TOP_BAR_H + 10.0, SIDEBAR_W - 16.0, ROW_H),
             shot_btn: Rect::new(180.0, 11.0, 130.0, 30.0),
             run_btn: Rect::new(SIDEBAR_W + 16.0, TOP_BAR_H + 76.0, ACTIONS_W - 32.0, ROW_H),
             stop_btn: Rect::new(
@@ -50,31 +48,48 @@ impl Layout {
     }
 }
 
-/// One display row of the sidebar list: a folder header or a test row.
+/// Folders of `items` in first-appearance order.
+pub fn folders(items: &[(&'static str, &'static str)]) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for &(_, folder) in items {
+        if !out.contains(&folder) {
+            out.push(folder);
+        }
+    }
+    out
+}
+
+/// One display row of the sidebar: a folder group header or a test row.
 pub struct ListRow {
     pub rect: Rect,
-    /// Some(label) — folder header row; None — test row
+    /// Some(label) — folder group header row (a collapse toggle); None — test row
     pub folder: Option<&'static str>,
     /// test index for test rows
     pub test: Option<usize>,
 }
 
-/// Sidebar display rows: a folder header is inserted before the first test
-/// of each folder, in first-appearance order. `items` — (test name, folder)
-/// in registration order.
-pub fn list_rows(items: &[(&'static str, &'static str)]) -> Vec<ListRow> {
+/// Sidebar display rows: one group header per folder (first-appearance
+/// order), and — only for expanded folders — the test rows of that folder.
+/// `expanded` — the set of expanded folder labels.
+pub fn list_rows(
+    items: &[(&'static str, &'static str)],
+    expanded: &[&'static str],
+) -> Vec<ListRow> {
     let mut rows = Vec::new();
     let mut seen: Vec<&'static str> = Vec::new();
-    let mut y = TOP_BAR_H + 10.0 + ROW_H + 4.0;
+    let mut y = TOP_BAR_H + 10.0;
     for (i, &(_, folder)) in items.iter().enumerate() {
         if !seen.contains(&folder) {
             seen.push(folder);
             rows.push(ListRow {
-                rect: Rect::new(16.0, y, SIDEBAR_W - 32.0, ROW_H),
+                rect: Rect::new(8.0, y, SIDEBAR_W - 16.0, ROW_H),
                 folder: Some(folder),
                 test: None,
             });
             y += ROW_H;
+        }
+        if !expanded.contains(&folder) {
+            continue;
         }
         rows.push(ListRow {
             rect: Rect::new(16.0, y, SIDEBAR_W - 32.0, ROW_H),

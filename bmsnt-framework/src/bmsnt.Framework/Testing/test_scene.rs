@@ -17,6 +17,17 @@ pub trait TestCase {
         "GRAPHIC TESTS"
     }
 
+    /// The scene is active immediately on selection (no RUN/STOP actions).
+    fn auto_start(&self) -> bool {
+        false
+    }
+
+    /// The scene draws over the whole area right of the panels (no 16:9
+    /// game view, no caption).
+    fn full_area(&self) -> bool {
+        false
+    }
+
     /// Draw one frame of the scene. `view` — game-view rect in design space,
     /// `s` — design->framebuffer scale, `res` — framebuffer size,
     /// `t` — seconds since app start, `input` — per-frame input state.

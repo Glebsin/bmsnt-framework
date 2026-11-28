@@ -20,8 +20,9 @@ use crate::platform::window::Window;
 use crate::statistics::{FrameStats, WARMUP_MS};
 use crate::text::MAX_VERTS;
 
-use crate::testing::design_palette::{DESIGN_H, DESIGN_W};
-use crate::testing::scenes::{KeysScreen, SpriteBatchScreen};
+use crate::graphics::primitives::Rect;
+use crate::testing::design_palette::{ACTIONS_W, DESIGN_H, DESIGN_W, SIDEBAR_W, TOP_BAR_H};
+use crate::testing::scenes::{KeyCombinationScreen, SpriteBatchScreen};
 use crate::testing::test_scene::TestCase;
 use crate::testing::ui as ui;
 use crate::testing::ui::{Layout, UiState};
@@ -40,7 +41,7 @@ type UiSig = (
     i64,
     u64,           // fps text
     bool,          // flip status
-    bool,          // ui.expanded
+    usize,         // ui.expanded_folders.len()
     Option<usize>, // ui.selected_test
     bool,          // ui.running
     u32,
@@ -135,10 +136,26 @@ impl Game {
 
         let screens: Vec<Box<dyn TestCase>> = vec![
             Box::new(SpriteBatchScreen::new()),
-            Box::new(KeysScreen::new()),
+            Box::new(KeyCombinationScreen::new()),
         ];
         let screen_items: Vec<(&'static str, &'static str)> =
             screens.iter().map(|t| (t.name(), t.folder())).collect();
+
+        // groups start collapsed; only the folder of the scene that was open
+        // at the last clean exit is expanded (persisted next to the exe)
+        let mut ui = UiState::from_env();
+        if ui.selected_test.is_none() {
+            if let Ok(s) = std::fs::read_to_string(state_path()) {
+                if let Ok(i) = s.trim().parse::<usize>() {
+                    if i < screens.len() {
+                        ui.selected_test = Some(i);
+                    }
+                }
+            }
+        }
+        if let Some(i) = ui.selected_test.filter(|&i| i < screens.len()) {
+            ui.expanded_folders.push(screens[i].folder());
+        }
 
         crate::elog!(
             "bmsnt_test_browser swapchain: {}x{} images={} present_mode={:?}",
@@ -158,7 +175,7 @@ impl Game {
             input,
             act_quit,
             act_shot,
-            ui: UiState::from_env(),
+            ui,
             screens,
             stats: FrameStats::new(sdl3_sys::everything::SDL_GetTicks()),
             t_start: Instant::now(),
@@ -257,10 +274,7 @@ impl Game {
 
             // active scene (None = idle): computed AFTER clicks, a click may
             // clear the selection and stop the scene
-            let scene_idx = self
-                .ui
-                .selected_test
-                .filter(|&i| i < self.screens.len() && self.ui.running);
+            let scene_idx = self.active_scene();
             let scene_running = scene_idx.is_some();
 
             let sig: UiSig = (
@@ -269,7 +283,7 @@ impl Game {
                 shown_fps,
                 fps_ms.to_bits(),
                 flip_lost,
-                self.ui.expanded,
+                self.ui.expanded_folders.len(),
                 self.ui.selected_test,
                 self.ui.running,
                 w.to_bits(),
@@ -284,6 +298,14 @@ impl Game {
                     if flip_lost { "FLIP LOST" } else { "FLIP OK" }
                 );
                 let t_ui0 = Instant::now();
+                let scene_full = scene_idx
+                    .map(|i| self.screens[i].full_area())
+                    .unwrap_or(false);
+                let has_actions = self
+                    .ui
+                    .selected_test
+                    .map(|i| i < self.screens.len() && !self.screens[i].auto_start())
+                    .unwrap_or(false);
                 self.sprites.begin();
                 let verts = ui::draw(
                     &mut self.sprites,
@@ -295,6 +317,8 @@ impl Game {
                     (w, h),
                     &status,
                     scene_running,
+                    scene_full,
+                    has_actions,
                 );
                 self.stats.t_ui += t_ui0.elapsed().as_nanos();
 
@@ -327,13 +351,26 @@ impl Game {
                     self.sprites.push_cached(&self.ui_snap, [0.0, 0.0, w, h])?;
                 }
                 if let Some(i) = scene_idx {
+                    let full_area = self.screens[i].full_area();
                     let screen = self.screens[i].as_mut();
                     let t = self.t_start.elapsed().as_secs_f32();
+                    // full-area scenes render over the whole right side; the
+                    // rest stay inside the scissored 16:9 game view
+                    let view = if full_area {
+                        Rect::new(
+                            SIDEBAR_W + ACTIONS_W,
+                            TOP_BAR_H,
+                            DESIGN_W - SIDEBAR_W - ACTIONS_W,
+                            DESIGN_H - TOP_BAR_H,
+                        )
+                    } else {
+                        layout.game
+                    };
                     let mut scene_text = Vec::new();
                     let t_sc0 = Instant::now();
                     screen.draw(
                         &mut self.sprites,
-                        layout.game,
+                        view,
                         s,
                         (w, h),
                         t,
@@ -444,6 +481,11 @@ impl Game {
         }
 
         // --- teardown ---
+        // persist the scene that was open at exit: its folder group starts
+        // expanded on the next launch
+        let last_active = self.active_scene();
+        let _ = std::fs::write(state_path(), last_active.map(|i| i.to_string()).unwrap_or_default());
+
         // tolerant: the device may have been lost during the session
         crate::elog!("teardown: idle");
         let _ = self.ctx.device().device_wait_idle();
@@ -520,30 +562,45 @@ impl Game {
         Ok(img_idx)
     }
 
+    /// The scene currently active: selected, and either started with RUN or
+    /// auto-started on selection.
+    fn active_scene(&self) -> Option<usize> {
+        self.ui.selected_test.filter(|&i| {
+            i < self.screens.len() && (self.ui.running || self.screens[i].auto_start())
+        })
+    }
+
     /// Click handling: buttons, test rows; empty space clears the selection
     /// and stops the scene.
     fn clicks(&mut self, layout: &Layout, mx: f32, my: f32) {
         if !self.input.mouse_pressed(1) {
             return;
         }
+        let has_actions = self
+            .ui
+            .selected_test
+            .map(|i| i < self.screens.len() && !self.screens[i].auto_start())
+            .unwrap_or(false);
         let mut handled = false;
         if layout.shot_btn.hit(mx, my) {
             self.renderer.request_screenshot();
             handled = true;
-        } else if layout.header.hit(mx, my) {
-            self.ui.expanded = !self.ui.expanded;
-            handled = true;
-        } else if self.ui.expanded {
-            if let Some(t) = ui::list_rows(&self.screen_items)
-                .iter()
-                .find(|r| r.test.is_some() && r.rect.hit(mx, my))
-                .and_then(|r| r.test)
-            {
-                self.ui.selected_test = Some(t);
-                handled = true;
+        } else {
+            for row in ui::list_rows(&self.screen_items, &self.ui.expanded_folders) {
+                if let Some(folder) = row.folder {
+                    if row.rect.hit(mx, my) {
+                        self.ui.toggle_folder(folder);
+                        handled = true;
+                        break;
+                    }
+                } else if row.rect.hit(mx, my) {
+                    self.ui.selected_test = row.test;
+                    handled = true;
+                    break;
+                }
             }
         }
-        if self.ui.selected_test.is_some() {
+        if self.ui.selected_test.is_some() && has_actions {
             if layout.run_btn.hit(mx, my) {
                 self.ui.running = true;
                 handled = true;
@@ -735,6 +792,14 @@ impl Game {
 
 /// Screenshots go to `<exe dir>/Screenshots/bmsnt_test_browser_<n>.png`; `n` is the
 /// first free number so files never overwrite each other.
+/// Path of the persisted UI state: the scene index that was open at the
+/// last clean exit (empty = idle).
+fn state_path() -> std::path::PathBuf {
+    let mut p = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    p.set_file_name("test_browser_state");
+    p
+}
+
 fn screenshot_path() -> Result<std::path::PathBuf> {
     let exe = std::env::current_exe().context("current_exe")?;
     let dir = exe

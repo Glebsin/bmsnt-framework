@@ -5,18 +5,19 @@
 
 mod layout;
 
-pub use layout::{list_rows, Layout, ListRow};
+pub use layout::{folders, list_rows, Layout, ListRow};
 
 use crate::graphics::sprites::SpriteBatcher;
 use crate::text::{build_text, Vertex};
 
 use crate::testing::design_palette::*;
 
-/// Mutable UI state (selection, running test, list expanded).
+/// Mutable UI state (selection, running test, expanded folder groups).
 pub struct UiState {
-    pub expanded: bool,
     pub selected_test: Option<usize>,
     pub running: bool,
+    /// folder labels whose sidebar groups are expanded
+    pub expanded_folders: Vec<&'static str>,
 }
 
 impl UiState {
@@ -24,11 +25,20 @@ impl UiState {
     /// automated runs).
     pub fn from_env() -> Self {
         Self {
-            expanded: true,
             selected_test: std::env::var("BMSNT_TEST")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok()),
             running: std::env::var("BMSNT_TEST").is_ok(),
+            expanded_folders: Vec::new(),
+        }
+    }
+
+    /// Expand/collapse a folder group.
+    pub fn toggle_folder(&mut self, folder: &'static str) {
+        if let Some(p) = self.expanded_folders.iter().position(|&f| f == folder) {
+            self.expanded_folders.swap_remove(p);
+        } else {
+            self.expanded_folders.push(folder);
         }
     }
 }
@@ -49,9 +59,13 @@ pub fn draw(
     res: (f32, f32),
     status: &str,
     scene_running: bool,
+    // active scene draws over the whole area (no game view)
+    scene_full: bool,
+    // selected scene has RUN/STOP actions
+    has_actions: bool,
 ) -> Vec<Vertex> {
     let mut verts = Vec::new();
-    let rows = list_rows(items);
+    let rows = list_rows(items, &ui.expanded_folders);
 
     // --- sprites: background, panels, rows ---
     sprites.begin_section(0.0, 0.0, res.0, res.1);
@@ -95,28 +109,20 @@ pub fn draw(
         res,
     );
 
-    // collapsible header item
-    let header_hover = layout.header.hit(mx, my);
-    sprites.solid(
-        layout.header.x,
-        layout.header.y,
-        layout.header.w,
-        layout.header.h,
-        if header_hover {
-            COL_ROW_HOVER
+    // folder groups: collapsible header rows (styled like the old TESTS
+    // header: filled row + white label) + (expanded) test rows
+    for row in &rows {
+        if let Some(_folder) = row.folder {
+            let hovered = row.rect.hit(mx, my);
+            sprites.solid(
+                row.rect.x,
+                row.rect.y,
+                row.rect.w,
+                row.rect.h,
+                if hovered { COL_ROW_HOVER } else { COL_ROW_SEL },
+                res,
+            );
         } else {
-            COL_ROW_SEL
-        },
-        res,
-    );
-
-    // expanded list: folder headers + test rows
-    if ui.expanded {
-        for row in &rows {
-            if let Some(_folder) = row.folder {
-                // folder header: thin accent line on top of the row
-                sprites.solid(row.rect.x, row.rect.y, row.rect.w, 1.0, COL_BORDER, res);
-            } else {
                 let r = &row.rect;
                 let sel = ui.selected_test == row.test;
                 let hovered = r.hit(mx, my);
@@ -133,7 +139,6 @@ pub fn draw(
                 if sel {
                     sprites.solid(r.x, r.y, 3.0, r.h, COL_ACCENT, res);
                 }
-            }
         }
     }
 
@@ -147,8 +152,9 @@ pub fn draw(
         res,
     );
 
-    // action buttons (real actions of the selected test)
-    if ui.selected_test.is_some() {
+    // action buttons: only for scenes with RUN/STOP; auto-start scenes have
+    // no actions at all
+    if ui.selected_test.is_some() && has_actions {
         let run_hover = layout.run_btn.hit(mx, my);
         let stop_hover = layout.stop_btn.hit(mx, my);
         sprites.solid(
@@ -181,9 +187,13 @@ pub fn draw(
         );
     }
 
-    // game view backdrop (no border frame; the scene renders inside, scissored)
+    // game view backdrop (no border frame; the scene renders inside, scissored);
+    // shown only when a scene is selected; full-area scenes cover the whole
+    // right side themselves — no backdrop
     let g = &layout.game;
-    sprites.solid(g.x, g.y, g.w, g.h, COL_GAME_BG, res);
+    if !scene_full && ui.selected_test.is_some() {
+        sprites.solid(g.x, g.y, g.w, g.h, COL_GAME_BG, res);
+    }
 
     // --- text ---
     verts.extend(build_text(
@@ -215,27 +225,9 @@ pub fn draw(
         COL_TEXT_DIM,
     ));
 
-    // sidebar: header + test list
-    verts.extend(build_text(
-        "TESTS",
-        layout.header.x + 12.0,
-        layout.header.y + 11.0,
-        2.0,
-        res.0,
-        res.1,
-        COL_TEXT,
-    ));
-    verts.extend(build_text(
-        if ui.expanded { "-" } else { "+" },
-        layout.header.x + layout.header.w - 24.0,
-        layout.header.y + 11.0,
-        2.0,
-        res.0,
-        res.1,
-        COL_TEXT_DIM,
-    ));
-    if ui.expanded {
-        for row in &rows {
+    // sidebar: folder group headers (white on filled row, with -/+ indicator)
+    // and test rows (grey, bright when selected)
+    for row in &rows {
             let r = &row.rect;
             if let Some(folder) = row.folder {
                 verts.extend(build_text(
@@ -245,7 +237,17 @@ pub fn draw(
                     2.0,
                     res.0,
                     res.1,
-                    COL_ACCENT,
+                    COL_TEXT,
+                ));
+                let expanded = ui.expanded_folders.contains(&folder);
+                verts.extend(build_text(
+                    if expanded { "-" } else { "+" },
+                    r.x + r.w - 24.0,
+                    r.y + 11.0,
+                    2.0,
+                    res.0,
+                    res.1,
+                    COL_TEXT_DIM,
                 ));
             } else {
                 let i = row.test.unwrap_or(0);
@@ -260,7 +262,6 @@ pub fn draw(
                     if sel { COL_TEXT } else { COL_TEXT_DIM },
                 ));
             }
-        }
     }
 
     // actions panel
@@ -274,33 +275,35 @@ pub fn draw(
         COL_TEXT_DIM,
     ));
     if let Some(test) = ui.selected_test.filter(|&i| i < items.len()) {
-        verts.extend(build_text(
-            items[test].0,
-            SIDEBAR_W + 16.0,
-            TOP_BAR_H + 44.0,
-            2.0,
-            res.0,
-            res.1,
-            COL_TEXT,
-        ));
-        verts.extend(build_text(
-            "RUN",
-            layout.run_btn.x + (layout.run_btn.w - 3.0 * 12.0) / 2.0,
-            layout.run_btn.y + 11.0,
-            2.0,
-            res.0,
-            res.1,
-            if ui.running { COL_TEXT } else { COL_TEXT_DIM },
-        ));
-        verts.extend(build_text(
-            "STOP",
-            layout.stop_btn.x + (layout.stop_btn.w - 4.0 * 12.0) / 2.0,
-            layout.stop_btn.y + 11.0,
-            2.0,
-            res.0,
-            res.1,
-            if ui.running { COL_TEXT } else { COL_TEXT_DIM },
-        ));
+        if has_actions {
+            verts.extend(build_text(
+                items[test].0,
+                SIDEBAR_W + 16.0,
+                TOP_BAR_H + 44.0,
+                2.0,
+                res.0,
+                res.1,
+                COL_TEXT,
+            ));
+            verts.extend(build_text(
+                "RUN",
+                layout.run_btn.x + (layout.run_btn.w - 3.0 * 12.0) / 2.0,
+                layout.run_btn.y + 11.0,
+                2.0,
+                res.0,
+                res.1,
+                if ui.running { COL_TEXT } else { COL_TEXT_DIM },
+            ));
+            verts.extend(build_text(
+                "STOP",
+                layout.stop_btn.x + (layout.stop_btn.w - 4.0 * 12.0) / 2.0,
+                layout.stop_btn.y + 11.0,
+                2.0,
+                res.0,
+                res.1,
+                if ui.running { COL_TEXT } else { COL_TEXT_DIM },
+            ));
+        }
     } else {
         verts.extend(build_text(
             "SELECT A TEST",
@@ -313,22 +316,25 @@ pub fn draw(
         ));
     }
 
-    // game view caption
-    let cap = format!(
-        "GAME VIEW 16:9  {}x{}  {}",
-        layout.game.w as u32,
-        layout.game.h as u32,
-        if scene_running { "RUNNING" } else { "IDLE" }
-    );
-    verts.extend(build_text(
-        &cap,
-        g.x + 8.0,
-        g.y + 8.0,
-        2.0,
-        res.0,
-        res.1,
-        COL_TEXT_DIM,
-    ));
+    // game view caption (only when a scene is selected; full-area scenes
+    // have no game view)
+    if !scene_full && ui.selected_test.is_some() {
+        let cap = format!(
+            "GAME VIEW 16:9  {}x{}  {}",
+            layout.game.w as u32,
+            layout.game.h as u32,
+            if scene_running { "RUNNING" } else { "IDLE" }
+        );
+        verts.extend(build_text(
+            &cap,
+            g.x + 8.0,
+            g.y + 8.0,
+            2.0,
+            res.0,
+            res.1,
+            COL_TEXT_DIM,
+        ));
+    }
 
     verts
 }
