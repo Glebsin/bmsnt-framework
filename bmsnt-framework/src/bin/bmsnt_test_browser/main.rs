@@ -1,4 +1,4 @@
-//! TestApp: test browser for engine features (Phase 2 proving ground).
+//! TestApp: test browser for engine features (proving ground).
 //! Thin shell: the whole browser lives in the framework library
 //! (`bmsnt_framework::testing`).
 

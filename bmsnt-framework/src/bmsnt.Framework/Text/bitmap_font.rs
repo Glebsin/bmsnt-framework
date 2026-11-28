@@ -1,4 +1,4 @@
-//! Text: 5x7 bitmap font -> triangles. Temporary until the glyph atlas (Phase 2).
+//! Text: 5x7 bitmap font -> triangles. Temporary until the glyph atlas.
 
 #[repr(C)]
 #[derive(Clone, Copy)]
